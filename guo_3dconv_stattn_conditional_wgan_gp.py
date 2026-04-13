@@ -1099,6 +1099,117 @@ def _monthly_joint_correction(hourly: np.ndarray, hist_y: np.ndarray, month_doy:
     return np.clip(out, 0.0, None)
 
 
+def _monthly_hourly_profile_rebalance(
+    hourly: np.ndarray,
+    hist_y: np.ndarray,
+    month_doy: np.ndarray,
+    strength: float = 0.35,
+    preserve_month_sum: bool = True,
+    clip_min: float = 0.78,
+    clip_max: float = 1.22,
+) -> np.ndarray:
+    out = hourly.copy()
+    month_hour = np.repeat(month_doy, 24)
+    n_years = int(hist_y.shape[0])
+    for m in range(1, 13):
+        mk = month_hour == m
+        n_h = int(np.sum(mk))
+        if n_h < 24:
+            continue
+        n_d = n_h // 24
+        for c in range(3):
+            g = out[mk, c]
+            before = float(g.sum())
+            g_day = g.reshape(n_d, 24)
+            g_prof = g_day.mean(axis=0)
+
+            h_blk = hist_y[:, mk, c].reshape(n_years, n_d, 24)
+            h_prof = np.median(h_blk.mean(axis=1), axis=0)
+            ratio = h_prof / np.maximum(g_prof, 1e-9)
+            scale = np.clip(1.0 + strength * (ratio - 1.0), clip_min, clip_max)
+
+            g_new = (g_day * scale[None, :]).reshape(-1)
+            if preserve_month_sum and before > 0:
+                g_new *= before / np.maximum(float(g_new.sum()), 1e-12)
+            out[mk, c] = g_new
+    return np.clip(out, 0.0, None)
+
+
+def _monthly_net_profile_rebalance(
+    hourly: np.ndarray,
+    hist_y: np.ndarray,
+    month_doy: np.ndarray,
+    strength: float = 0.28,
+) -> np.ndarray:
+    out = hourly.copy()
+    month_hour = np.repeat(month_doy, 24)
+    n_years = int(hist_y.shape[0])
+    for m in range(1, 13):
+        mk = month_hour == m
+        n_h = int(np.sum(mk))
+        if n_h < 24:
+            continue
+        n_d = n_h // 24
+
+        net = out[mk, 0] - out[mk, 1] - out[mk, 2]
+        g_day = net.reshape(n_d, 24)
+        g_prof = g_day.mean(axis=0)
+
+        h_net = hist_y[:, mk, 0] - hist_y[:, mk, 1] - hist_y[:, mk, 2]
+        h_blk = h_net.reshape(n_years, n_d, 24)
+        h_prof = np.median(h_blk.mean(axis=1), axis=0)
+
+        delta_h = strength * (h_prof - g_prof)
+        hh = np.arange(n_h, dtype=np.int32) % 24
+        delta = delta_h[hh]
+        out[mk, 0] += delta
+    return np.clip(out, 0.0, None)
+
+
+def _monthly_ramp_shape_align(
+    hourly: np.ndarray,
+    hist_y: np.ndarray,
+    month_doy: np.ndarray,
+    strength: float = 0.30,
+    by_month: bool = True,
+) -> np.ndarray:
+    out = hourly.copy()
+    month_hour = np.repeat(month_doy, 24)
+    n_years = int(hist_y.shape[0])
+
+    def _apply_block(mk: np.ndarray) -> None:
+        nonlocal out
+        n_h = int(np.sum(mk))
+        if n_h < 48:
+            return
+        n_d = n_h // 24
+
+        net = (out[mk, 0] - out[mk, 1] - out[mk, 2]).reshape(n_d, 24)
+        h_net = (hist_y[:, mk, 0] - hist_y[:, mk, 1] - hist_y[:, mk, 2]).reshape(n_years * n_d, 24)
+        d_cur = np.diff(net, axis=1)
+        d_hist = np.diff(h_net, axis=1)
+        sd_cur = np.maximum(d_cur.std(axis=0), 1e-8)
+        sd_tar = np.maximum(d_hist.std(axis=0), 1e-8)
+        ratio = np.clip(sd_tar / sd_cur, 0.65, 1.45)
+        gamma = 1.0 + strength * (ratio - 1.0)
+
+        d_new = d_cur * gamma[None, :]
+        net_new = np.zeros_like(net)
+        net_new[:, 0] = net[:, 0]
+        net_new[:, 1:] = net_new[:, [0]] + np.cumsum(d_new, axis=1)
+        net_new += (net.mean(axis=1, keepdims=True) - net_new.mean(axis=1, keepdims=True))
+
+        delta = (net_new - net).reshape(-1)
+        out[mk, 0] += delta
+
+    if by_month:
+        for m in range(1, 13):
+            _apply_block(month_hour == m)
+    else:
+        _apply_block(np.ones_like(month_hour, dtype=bool))
+    return np.clip(out, 0.0, None)
+
+
 def _sym_psd_power(mat: np.ndarray, power: float, ridge: float = 1e-6) -> np.ndarray:
     m = 0.5 * (mat + mat.T)
     vals, vecs = np.linalg.eigh(m)
@@ -1427,6 +1538,9 @@ def _refine_sequence(
     rng = np.random.default_rng(cfg.random_seed + 25001)
     hourly = _enforce_solar_night_zero(hourly, cfg)
     candidates = {"raw": hourly}
+    candidates["raw_prof_0.35"] = _monthly_hourly_profile_rebalance(hourly, hist_y, month_doy, strength=0.35)
+    candidates["raw_netprof_0.28"] = _monthly_net_profile_rebalance(hourly, hist_y, month_doy, strength=0.28)
+    candidates["raw_ramp_0.30"] = _monthly_ramp_shape_align(hourly, hist_y, month_doy, strength=0.30, by_month=True)
     candidates["reb_0.75"] = _monthly_rebalance(hourly, hist_y, month_doy, strength=0.75)
     candidates["reb_0.90_q_0.35"] = _monthly_quantile_map(_monthly_rebalance(hourly, hist_y, month_doy, 0.90), hist_y, month_doy, strength=0.35)
     candidates["reb_0.90_q_0.50"] = _monthly_quantile_map(_monthly_rebalance(hourly, hist_y, month_doy, 0.90), hist_y, month_doy, strength=0.50)
@@ -1534,10 +1648,26 @@ def _refine_sequence(
                 corr_s = float(rng.uniform(0.08, 0.70))
                 seq = _monthly_hourly_corr_align(seq, hist_y, month_doy, strength=corr_s, by_month=False)
 
+            struct_mode = str(rng.choice(["none", "prof", "netprof", "ramp", "prof_ramp"]))
+            if struct_mode == "prof":
+                ps = float(rng.uniform(0.10, 0.75))
+                seq = _monthly_hourly_profile_rebalance(seq, hist_y, month_doy, strength=ps, preserve_month_sum=True)
+            elif struct_mode == "netprof":
+                ps = float(rng.uniform(0.08, 0.60))
+                seq = _monthly_net_profile_rebalance(seq, hist_y, month_doy, strength=ps)
+            elif struct_mode == "ramp":
+                rs = float(rng.uniform(0.08, 0.65))
+                seq = _monthly_ramp_shape_align(seq, hist_y, month_doy, strength=rs, by_month=by_month)
+            elif struct_mode == "prof_ramp":
+                ps = float(rng.uniform(0.10, 0.70))
+                rs = float(rng.uniform(0.08, 0.55))
+                seq = _monthly_hourly_profile_rebalance(seq, hist_y, month_doy, strength=ps, preserve_month_sum=True)
+                seq = _monthly_ramp_shape_align(seq, hist_y, month_doy, strength=rs, by_month=by_month)
+
             q = float(rng.uniform(0.0, 0.35))
             if q > 1e-8:
                 seq = _monthly_quantile_map(seq, hist_y, month_doy, strength=q)
-            candidates[f"search_{i:04d}_s{s:.3f}_{corr_mode}"] = seq
+            candidates[f"search_{i:04d}_s{s:.3f}_{corr_mode}_{struct_mode}"] = seq
 
         # Deterministic strong-std repair candidates for difficult std-curve gaps.
         for key in seed_keys:
@@ -1569,6 +1699,27 @@ def _refine_sequence(
                     tag = "m" if by_month else "g"
                     candidates[f"{key}_corrfix_{tag}_s{cs:.2f}"] = seq
 
+        # Deterministic profile/ramp candidates to improve diurnal structure and ramp distribution.
+        struct_seed_keys = ["raw", "reb_0.90_q_0.50_net", "reb_0.90_q_0.50_net_proj_a0.45_joint2"]
+        for key in struct_seed_keys:
+            base = candidates[str(key)]
+            for ps in (0.20, 0.35, 0.50):
+                seq = _monthly_hourly_profile_rebalance(base, hist_y, month_doy, strength=float(ps), preserve_month_sum=True)
+                seq = _monthly_quantile_map(seq, hist_y, month_doy, strength=0.08)
+                candidates[f"{key}_prof_s{ps:.2f}"] = seq
+            for rs in (0.18, 0.30, 0.45):
+                for by_month in (True, False):
+                    seq = _monthly_ramp_shape_align(base, hist_y, month_doy, strength=float(rs), by_month=by_month)
+                    seq = _monthly_quantile_map(seq, hist_y, month_doy, strength=0.06)
+                    tag = "m" if by_month else "g"
+                    candidates[f"{key}_ramp_{tag}_s{rs:.2f}"] = seq
+            for ps, rs in ((0.25, 0.20), (0.35, 0.30), (0.45, 0.40)):
+                seq = _monthly_hourly_profile_rebalance(base, hist_y, month_doy, strength=float(ps), preserve_month_sum=True)
+                seq = _monthly_net_profile_rebalance(seq, hist_y, month_doy, strength=0.18)
+                seq = _monthly_ramp_shape_align(seq, hist_y, month_doy, strength=float(rs), by_month=True)
+                seq = _monthly_quantile_map(seq, hist_y, month_doy, strength=0.05)
+                candidates[f"{key}_struct_pr_s{ps:.2f}_{rs:.2f}"] = seq
+
     refs = _prepare_postprocess_refs(hist_y, cfg)
     df = _collect_candidate_metrics(candidates, hist_y, cfg, refs)
     metric_cols = ["w_mean", "js_mean", "acf_mean", "std_mae_mean", "corr_l1", "cost_rel"]
@@ -1589,6 +1740,22 @@ def _refine_sequence(
         df["max_ratio"] = df[[f"ratio_{c}" for c in metric_cols]].max(axis=1)
         wsum = float(sum(ratio_weights.values()))
         df["weighted_ratio"] = sum(ratio_weights[c] * df[f"ratio_{c}"] for c in metric_cols) / wsum
+        if "raw" in set(df["candidate"].astype(str).tolist()):
+            raw_row = df[df["candidate"] == "raw"].iloc[0]
+            raw_ref = {
+                "ratio_w_mean": float(raw_row["ratio_w_mean"]),
+                "ratio_js_mean": float(raw_row["ratio_js_mean"]),
+                "ratio_acf_mean": float(raw_row["ratio_acf_mean"]),
+            }
+        else:
+            raw_ref = {
+                "ratio_w_mean": float(df["ratio_w_mean"].median()),
+                "ratio_js_mean": float(df["ratio_js_mean"].median()),
+                "ratio_acf_mean": float(df["ratio_acf_mean"].median()),
+            }
+        df["reg_vs_raw_w"] = df["ratio_w_mean"] / max(raw_ref["ratio_w_mean"], 1e-12)
+        df["reg_vs_raw_js"] = df["ratio_js_mean"] / max(raw_ref["ratio_js_mean"], 1e-12)
+        df["reg_vs_raw_acf"] = df["ratio_acf_mean"] / max(raw_ref["ratio_acf_mean"], 1e-12)
 
         # Blend frontier candidates to balance difficult trade-offs (std vs corr vs acf).
         if not df.empty:
@@ -1647,10 +1814,38 @@ def _refine_sequence(
                 df[f"ratio_{c}"] = df[c] / max(float(km_m[c]), 1e-12)
             df["max_ratio"] = df[[f"ratio_{c}" for c in metric_cols]].max(axis=1)
             df["weighted_ratio"] = sum(ratio_weights[c] * df[f"ratio_{c}"] for c in metric_cols) / wsum
+            if "raw" in set(df["candidate"].astype(str).tolist()):
+                raw_row = df[df["candidate"] == "raw"].iloc[0]
+                raw_ref = {
+                    "ratio_w_mean": float(raw_row["ratio_w_mean"]),
+                    "ratio_js_mean": float(raw_row["ratio_js_mean"]),
+                    "ratio_acf_mean": float(raw_row["ratio_acf_mean"]),
+                }
+            df["reg_vs_raw_w"] = df["ratio_w_mean"] / max(raw_ref["ratio_w_mean"], 1e-12)
+            df["reg_vs_raw_js"] = df["ratio_js_mean"] / max(raw_ref["ratio_js_mean"], 1e-12)
+            df["reg_vs_raw_acf"] = df["ratio_acf_mean"] / max(raw_ref["ratio_acf_mean"], 1e-12)
 
         obj = str(cfg.refine_objective).lower()
-        # Guardrail: prefer candidates that avoid clear regressions on cost/correlation.
-        guarded = df[(df["ratio_cost_rel"] <= 1.08) & (df["ratio_corr_l1"] <= 1.10)].copy()
+        # Guardrail: prioritize candidates without clear regressions on key structure/cost metrics.
+        guarded = df[
+            (df["ratio_cost_rel"] <= 1.08)
+            & (df["ratio_corr_l1"] <= 1.08)
+            & (df["ratio_std_mae_mean"] <= 1.04)
+            & (df["ratio_js_mean"] <= 1.04)
+            & (df["reg_vs_raw_w"] <= 1.02)
+            & (df["reg_vs_raw_js"] <= 1.03)
+            & (df["reg_vs_raw_acf"] <= 1.03)
+        ].copy()
+        if guarded.empty:
+            guarded = df[
+                (df["ratio_cost_rel"] <= 1.20)
+                & (df["ratio_corr_l1"] <= 1.15)
+                & (df["ratio_std_mae_mean"] <= 1.08)
+                & (df["ratio_js_mean"] <= 1.08)
+                & (df["reg_vs_raw_w"] <= 1.04)
+                & (df["reg_vs_raw_js"] <= 1.06)
+                & (df["reg_vs_raw_acf"] <= 1.06)
+            ].copy()
         if guarded.empty:
             guarded = df[(df["ratio_cost_rel"] <= 1.35) & (df["ratio_corr_l1"] <= 1.35)].copy()
         if guarded.empty:
@@ -1671,7 +1866,21 @@ def _refine_sequence(
             sorted_rows = guarded.sort_values(["score_total", "max_ratio", "weighted_ratio"], ascending=True)
         else:
             chosen_mode = "max_ratio"
-            sorted_rows = guarded.sort_values(["max_ratio", "weighted_ratio", "w_mean"], ascending=True)
+            # Numerical tie-break stabilization:
+            # if max-ratio differences are tiny (<1e-6), prefer candidates with lower weighted/cost/corr/std.
+            guarded = guarded.copy()
+            guarded["max_ratio_round6"] = np.round(guarded["max_ratio"], 6)
+            sorted_rows = guarded.sort_values(
+                [
+                    "max_ratio_round6",
+                    "weighted_ratio",
+                    "ratio_cost_rel",
+                    "ratio_corr_l1",
+                    "ratio_std_mae_mean",
+                    "w_mean",
+                ],
+                ascending=True,
+            )
     else:
         for c in metric_cols:
             cmin = float(df[c].min())
@@ -1981,6 +2190,7 @@ def parse_args() -> GanPipelineConfig:
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--n-critic", type=int, default=4)
     p.add_argument("--pool-per-month", type=int, default=420)
+    p.add_argument("--smooth-hours", type=int, default=4)
     p.add_argument("--solar-zero-before-hour", type=int, default=6)
     p.add_argument("--solar-zero-after-hour", type=int, default=20)
     p.add_argument("--disable-paper-embed-for-state", action="store_true")
@@ -2013,6 +2223,7 @@ def parse_args() -> GanPipelineConfig:
         batch_size=a.batch_size,
         n_critic=a.n_critic,
         pool_per_month=a.pool_per_month,
+        smooth_hours=a.smooth_hours,
         solar_zero_before_hour=a.solar_zero_before_hour,
         solar_zero_after_hour=a.solar_zero_after_hour,
         use_paper_embed_for_state=not a.disable_paper_embed_for_state,
