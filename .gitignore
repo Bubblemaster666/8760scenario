@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+
+# Local/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Generated outputs (large, reproducible)
+background_8760_outputs/
+gan_background_outputs*/
+mock_*_outputs/
+*_outputs/
+
+# Temporary files
+_tmp_*
+*.log
