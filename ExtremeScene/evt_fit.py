@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+from scipy.stats import genpareto
+
+
+@dataclass
+class EVTConfig:
+    metric_col: str = "cum_deficit"
+    threshold_quantile: float = 0.90
+    severe_prob: float = 0.01
+    moderate_prob: float = 0.05
+    mild_prob: float = 0.10
+    min_exceedances: int = 5
+    eps: float = 1e-8
+
+
+def prob_to_level(
+    prob: float,
+    severe_prob: float,
+    moderate_prob: float,
+    mild_prob: float,
+) -> int:
+    if prob <= severe_prob:
+        return 3
+    if prob <= moderate_prob:
+        return 2
+    if prob <= mild_prob:
+        return 1
+    return 0
+
+
+def empirical_exceedance_prob(x: pd.Series, eps: float = 1e-8) -> pd.Series:
+    out = pd.Series(np.nan, index=x.index, dtype=float)
+    valid = x.notna()
+    n = int(valid.sum())
+    if n == 0:
+        return out
+    desc_rank = x.loc[valid].rank(method="average", ascending=False)
+    out.loc[valid] = desc_rank / (n + 1)
+    return out.clip(eps, 1.0)
+
+
+def compute_tail_score(prob: pd.Series | np.ndarray, eps: float = 1e-8) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    prob_arr = np.asarray(prob, dtype=float)
+    score = -np.log(np.clip(prob_arr, eps, 1.0))
+    mean = float(np.nanmean(score))
+    std = float(np.nanstd(score) + 1e-6)
+    z = (score - mean) / std
+    return score.astype(float), z.astype(float), {"mean": mean, "std": std}
+
+
+def fit_evt_and_label(
+    samples: pd.DataFrame,
+    cfg: Optional[EVTConfig] = None,
+) -> tuple[pd.DataFrame, dict]:
+    cfg = cfg or EVTConfig()
+    if samples.empty:
+        return samples.copy(), {"method": "empty"}
+    if cfg.metric_col not in samples.columns:
+        raise ValueError(f"samples is missing EVT metric column: {cfg.metric_col}")
+
+    out = samples.copy()
+    metric_series = out[cfg.metric_col].astype(float)
+    valid_x = metric_series.dropna().to_numpy(dtype=float)
+    if valid_x.size == 0:
+        raise ValueError(f"{cfg.metric_col} is empty after dropping NaNs.")
+
+    threshold_u = float(np.quantile(valid_x, cfg.threshold_quantile))
+    exceed = valid_x[valid_x > threshold_u] - threshold_u
+
+    if exceed.size < cfg.min_exceedances:
+        extreme_prob = empirical_exceedance_prob(metric_series, eps=cfg.eps)
+        method = "empirical_fallback"
+        evt_info = {
+            "method": method,
+            "metric_col": cfg.metric_col,
+            "threshold_u": threshold_u,
+            "n_total": int(valid_x.size),
+            "n_exceed": int(exceed.size),
+        }
+    else:
+        c, _, scale = genpareto.fit(exceed, floc=0)
+        tail_prob_at_u = float((valid_x > threshold_u).mean())
+        empirical_prob = empirical_exceedance_prob(metric_series, eps=cfg.eps)
+        probs = []
+        for idx, xi in enumerate(metric_series.to_numpy(dtype=float)):
+            if np.isnan(xi):
+                probs.append(np.nan)
+                continue
+            if xi <= threshold_u:
+                p = max(float(empirical_prob.iloc[idx]), tail_prob_at_u)
+            else:
+                y = xi - threshold_u
+                tail_cond = 1.0 - genpareto.cdf(y, c=c, loc=0, scale=scale)
+                p = tail_prob_at_u * tail_cond
+            probs.append(float(np.clip(p, cfg.eps, 1.0)))
+        extreme_prob = pd.Series(probs, index=out.index, dtype=float)
+        method = "pot_gpd"
+        evt_info = {
+            "method": method,
+            "metric_col": cfg.metric_col,
+            "threshold_u": threshold_u,
+            "shape_c": float(c),
+            "scale": float(scale),
+            "tail_prob_at_u": tail_prob_at_u,
+            "n_total": int(valid_x.size),
+            "n_exceed": int(exceed.size),
+        }
+
+    tail_score, tail_score_z, tail_score_stats = compute_tail_score(extreme_prob, eps=cfg.eps)
+    out["extreme_prob"] = np.asarray(extreme_prob, dtype=float)
+    out["tail_score"] = tail_score
+    out["tail_score_zscore"] = tail_score_z
+    out["severity_level"] = out["extreme_prob"].apply(
+        lambda p: np.nan
+        if pd.isna(p)
+        else prob_to_level(
+            float(p),
+            cfg.severe_prob,
+            cfg.moderate_prob,
+            cfg.mild_prob,
+        )
+    )
+    evt_info["tail_score_stats"] = tail_score_stats
+    evt_info["severity_thresholds"] = {
+        "severe_prob": cfg.severe_prob,
+        "moderate_prob": cfg.moderate_prob,
+        "mild_prob": cfg.mild_prob,
+    }
+    return out, evt_info
+
+
+if __name__ == "__main__":
+    df_demo = pd.DataFrame(
+        {
+            "sample_id": [f"S{i:04d}" for i in range(1, 16)],
+            "event_type": ["寒潮"] * 15,
+            "cum_deficit": [
+                1200,
+                1350,
+                1400,
+                1500,
+                1600,
+                1700,
+                1800,
+                1900,
+                2000,
+                2200,
+                2500,
+                2800,
+                3200,
+                4500,
+                7000,
+            ],
+        }
+    )
+
+    labeled, evt_info = fit_evt_and_label(df_demo, EVTConfig(min_exceedances=3))
+    print(evt_info)
+    print(labeled[["sample_id", "cum_deficit", "extreme_prob", "tail_score", "severity_level"]])
