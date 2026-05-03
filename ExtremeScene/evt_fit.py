@@ -12,6 +12,11 @@ from scipy.stats import genpareto
 class EVTConfig:
     metric_col: str = "cum_deficit"
     threshold_quantile: float = 0.90
+    severity_mode: str = "hybrid"
+    severity_q1: float = 0.60
+    severity_q2: float = 0.80
+    severity_q3: float = 0.92
+    severity_positive_only: bool = True
     severe_prob: float = 0.01
     moderate_prob: float = 0.05
     mild_prob: float = 0.10
@@ -52,6 +57,50 @@ def compute_tail_score(prob: pd.Series | np.ndarray, eps: float = 1e-8) -> tuple
     std = float(np.nanstd(score) + 1e-6)
     z = (score - mean) / std
     return score.astype(float), z.astype(float), {"mean": mean, "std": std}
+
+
+def metric_to_quantile_level(
+    metric: pd.Series,
+    q1: float = 0.60,
+    q2: float = 0.80,
+    q3: float = 0.92,
+    positive_only: bool = True,
+) -> tuple[pd.Series, dict[str, float | bool | int]]:
+    metric_numeric = metric.astype(float)
+    valid = metric_numeric.dropna()
+    base = valid[valid > 0] if positive_only else valid
+    used_positive_only = bool(positive_only and len(base) >= 4)
+    if not used_positive_only:
+        base = valid
+
+    if base.empty:
+        return pd.Series(0, index=metric.index, dtype=int), {
+            "q1": float("nan"),
+            "q2": float("nan"),
+            "q3": float("nan"),
+            "positive_only": used_positive_only,
+            "n_for_quantiles": 0,
+        }
+
+    q1_value = float(base.quantile(q1))
+    q2_value = float(base.quantile(q2))
+    q3_value = float(base.quantile(q3))
+
+    levels = pd.Series(0, index=metric.index, dtype=int)
+    values = metric_numeric.fillna(-np.inf)
+    levels = levels.mask(values >= q1_value, 1)
+    levels = levels.mask(values >= q2_value, 2)
+    levels = levels.mask(values >= q3_value, 3)
+    if used_positive_only:
+        levels = levels.mask(values <= 0, 0)
+
+    return levels.astype(int), {
+        "q1": q1_value,
+        "q2": q2_value,
+        "q3": q3_value,
+        "positive_only": used_positive_only,
+        "n_for_quantiles": int(len(base)),
+    }
 
 
 def fit_evt_and_label(
@@ -116,21 +165,45 @@ def fit_evt_and_label(
     out["extreme_prob"] = np.asarray(extreme_prob, dtype=float)
     out["tail_score"] = tail_score
     out["tail_score_zscore"] = tail_score_z
-    out["severity_level"] = out["extreme_prob"].apply(
-        lambda p: np.nan
-        if pd.isna(p)
-        else prob_to_level(
-            float(p),
-            cfg.severe_prob,
-            cfg.moderate_prob,
-            cfg.mild_prob,
+    severity_mode = cfg.severity_mode.strip().lower()
+    if severity_mode == "evt_prob":
+        out["severity_level"] = out["extreme_prob"].apply(
+            lambda p: np.nan
+            if pd.isna(p)
+            else prob_to_level(
+                float(p),
+                cfg.severe_prob,
+                cfg.moderate_prob,
+                cfg.mild_prob,
+            )
         )
-    )
+        severity_quantiles = {}
+    elif severity_mode in {"quantile", "hybrid"}:
+        levels, severity_quantiles = metric_to_quantile_level(
+            metric_series,
+            q1=cfg.severity_q1,
+            q2=cfg.severity_q2,
+            q3=cfg.severity_q3,
+            positive_only=cfg.severity_positive_only,
+        )
+        out["severity_level"] = levels
+    else:
+        raise ValueError("severity_mode must be one of {'evt_prob', 'quantile', 'hybrid'}.")
+
     evt_info["tail_score_stats"] = tail_score_stats
+    evt_info["severity_mode"] = severity_mode
+    evt_info["severity_quantiles"] = severity_quantiles
+    evt_info["severity_level_counts"] = {
+        str(k): int(v)
+        for k, v in out["severity_level"].fillna(0).astype(int).value_counts().sort_index().items()
+    }
     evt_info["severity_thresholds"] = {
         "severe_prob": cfg.severe_prob,
         "moderate_prob": cfg.moderate_prob,
         "mild_prob": cfg.mild_prob,
+        "severity_q1": cfg.severity_q1,
+        "severity_q2": cfg.severity_q2,
+        "severity_q3": cfg.severity_q3,
     }
     return out, evt_info
 

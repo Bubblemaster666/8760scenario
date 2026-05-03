@@ -141,6 +141,55 @@ python run_paper_pipeline.py --real-data-csv your_real_data.csv --seq-len 24 --o
 If your columns differ, update the column mapping in `data_interface.py` or wire a
 custom `ColumnMapping` into your own launcher.
 
+## Extreme Sample Library Construction
+
+本文首先基于气象阈值识别重大天气事件候选窗口，但并非所有气象极端窗口都会导致电力系统运行风险。因此，本文进一步引入基于净负荷的联合失衡风险筛选，以累计缺额、最大净负荷爬坡和持续失衡时长作为风险刻画指标，筛选得到风光荷联合失衡极端样本。对于样本规模有限导致 EVT 离散等级不均衡的问题，采用 POT-GPD 连续尾部概率与经验分位严重等级相结合的标注方式，以保证风险条件具有足够训练样本。
+
+Recommended preprocessing defaults:
+
+- `low_irr_quantile = 0.30`
+- `low_wind_quantile = 0.30`
+- `low_resource_min_hours = 3`
+- `daylight_irradiance_min = 30`
+- `risk_screen_enabled = True`
+- `risk_screen_mode = medium`
+- `imbalance_tau_mode = monthly_quantile`
+- `imbalance_tau_quantile = 0.75`
+- `severity_mode = hybrid`
+- `severity_q1/q2/q3 = 0.60/0.80/0.92`
+
+Rebuild only the sample library and diagnostics, without training models:
+
+```powershell
+python run_paper_pipeline.py --real-data-csv singleton_wind_solar_load_weather_hourly_8760_FY2019.csv --real-data-csv singleton_wind_solar_load_weather_hourly_8760_FY2020.csv --real-data-csv singleton_wind_solar_load_weather_hourly_8760_FY2021.csv --real-data-csv singleton_wind_solar_load_weather_hourly_8760_FY2022.csv --seq-len 24 --out-dir outputs/real_prescreen --skip-model-experiments
+```
+
+Important preprocessing outputs:
+
+- `dataset/samples_before_risk_screen.csv`
+- `dataset/samples_after_risk_screen.csv`
+- `dataset/samples_after_risk_screen_labeled.csv`
+- `dataset/risk_screen_summary.json`
+- `dataset/tau_diagnostic.csv`
+- `diagnostics/sample_overview.csv`
+- `diagnostics/event_type_risk_summary.csv`
+- `diagnostics/severity_risk_summary.csv`
+- `diagnostics/split_diagnostic.csv`
+- `diagnostics/diagnostic_summary.json`
+- `diagnostics/figures/`
+
+Run diagnostics on an existing sample table:
+
+```powershell
+python diagnose_extreme_samples.py --samples outputs/real_prescreen/dataset/samples_evt_labeled.csv --out-dir outputs/real_prescreen/diagnostics
+```
+
+Run the window-length sensitivity check without training:
+
+```powershell
+python run_window_sensitivity.py --real-data-csv singleton_wind_solar_load_weather_hourly_8760_FY2019.csv --real-data-csv singleton_wind_solar_load_weather_hourly_8760_FY2020.csv --real-data-csv singleton_wind_solar_load_weather_hourly_8760_FY2021.csv --real-data-csv singleton_wind_solar_load_weather_hourly_8760_FY2022.csv --out-dir outputs/window_sensitivity
+```
+
 ## Train The Proposed Method
 
 ```powershell
@@ -193,12 +242,13 @@ The main outputs are:
 ## Run Ablation Experiments
 
 ```powershell
-python run_experiments.py --data-dir outputs/demo/dataset --out-dir outputs/final --methods proposed no_evt no_risk_loss no_month flat_condition --stage1-epochs 12 --stage2-epochs 10 --stage3-epochs 2 --diffusion-steps 100 --base-channels 64 --batch-size 32
+python run_experiments.py --data-dir outputs/demo/dataset --out-dir outputs/final --methods proposed no_evt_strict no_evt no_risk_loss no_month flat_condition --stage1-epochs 12 --stage2-epochs 10 --stage3-epochs 2 --diffusion-steps 100 --base-channels 64 --batch-size 32
 ```
 
 Supported ablations:
 
 - `full`
+- `no_evt_strict`
 - `no_evt`
 - `no_risk_loss`
 - `no_month`
@@ -216,6 +266,7 @@ inside `summary.json`.
 Recommended ablation settings keep the same formal training budget as the full model:
 
 - `proposed/full`: EVT continuous risk, tail-sensitive loss, light risk consistency, month features, hierarchical condition.
+- `no_evt_strict`: zeros the whole risk layer, including `extreme_prob`, `tail_score`, and `severity_level`.
 - `no_evt`: removes continuous `extreme_prob` and `tail_score`; tail weighting falls back to `severity_level`.
 - `no_risk_loss`: keeps EVT conditions and tail loss, but forces `lambda_risk = 0`.
 - `no_month`: zeros the month sine/cosine background features.
@@ -252,7 +303,7 @@ Outputs:
 ## Unified Scenario Generation
 
 ```powershell
-python generate_scenarios.py --checkpoint outputs/demo/models/proposed/best_model.pt --data-dir outputs/demo/dataset --out-dir outputs/demo/models/proposed --split test
+python generate_scenarios.py --data-dir outputs/demo/dataset --out-dir outputs/demo/models/proposed --checkpoint-type best-risk --split test
 ```
 
 Outputs:
@@ -291,18 +342,57 @@ Key figures include:
 - `corr_matrix_generated.png`
 - `risk_metric_boxplot.png`
 
+## Paper Evaluation Logic
+
+The proposed method is not intended to be first on every marginal distribution
+metric. `mean_wasserstein`, `mean_js`, `acf_mae`, and `corr_matrix_error` are
+statistical realism checks: they verify that the generated load-wind-solar
+segments keep distribution shape, temporal continuity, and cross-variable
+correlation within an acceptable range.
+
+The main optimization target is joint imbalance risk under major weather events.
+The primary paper metrics are:
+
+- `cum_deficit_mae`
+- `q95_cum_deficit_error`
+- `q99_cum_deficit_error`
+- `netload_ramp_max_mae`
+- `imbalance_duration_mae`
+- `extreme_degree_match_rate`
+- `extreme_degree_adjacent_match_rate`
+
+Model selection therefore follows a risk-first, statistics-constrained rule.
+Risk metrics drive the rank score; statistical metrics only add a penalty when
+they degrade beyond the configured tolerance relative to strong baselines. This
+matches the paper claim: the method should preserve statistical realism while
+better representing joint imbalance risk.
+
 ## Unified Experiment Runner
 
 ```powershell
 python run_experiments.py --data-dir outputs/demo/dataset --out-dir outputs/demo
 ```
 
+Run only the main comparison:
+
+```powershell
+python run_experiments.py --data-dir outputs/demo/dataset --out-dir outputs/main_compare --preset main
+```
+
+Run only the ablation comparison:
+
+```powershell
+python run_experiments.py --data-dir outputs/demo/dataset --out-dir outputs/ablation --preset ablation
+```
+
 Default methods:
 
 - `traditional_gaussian_copula`
 - `plain_diffusion_baseline`
+- `improved_diffusion`
 - `enhanced_gan`
 - `proposed`
+- `no_evt_strict`
 - `no_evt`
 - `no_risk_loss`
 - `no_month`
@@ -314,6 +404,34 @@ It exports:
 
 The proposed and ablation methods now use the paper-level default training
 configuration unless command-line arguments override it.
+
+For proposed and risk-enabled ablations, generation defaults to `best-risk`
+checkpoint selection. Available checkpoint types are:
+
+- `best`: lowest validation total loss
+- `best-risk`: best Stage 3 risk-aware score
+- `final`: final EMA model
+
+```powershell
+python generate_scenarios.py --data-dir outputs/demo/dataset --out-dir outputs/demo/models/proposed --checkpoint-type best-risk --split test
+```
+
+## Result Summary
+
+```powershell
+python summarize_results.py --compare outputs/demo/evaluations/all_model_metrics.csv --out-dir outputs/demo/result_summary
+```
+
+The summary step exports:
+
+- `main_compare_paper_table.csv`
+- `ablation_paper_table.csv`
+- `complete_result_summary.csv`
+- `result_summary.md`
+
+The tables include `risk_rank_score`, `statistical_penalty`,
+`final_risk_oriented_score`, `statistical_status`, and
+`recommendation_reason`.
 
 ## Annual Embedding
 

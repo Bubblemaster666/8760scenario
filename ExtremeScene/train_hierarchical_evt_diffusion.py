@@ -95,20 +95,24 @@ def stage_name(epoch: int, cfg: TrainConfig) -> str:
 def innovation_flags(cfg: TrainConfig) -> dict[str, bool]:
     flags = {
         "hierarchical_condition": cfg.ablation != "flat_condition",
-        "evt_continuous_risk": cfg.ablation != "no_evt",
+        "evt_continuous_risk": cfg.ablation not in {"no_evt", "no_evt_continuous", "no_evt_strict"},
         "tail_sensitive_loss": True,
         "risk_consistency_loss": cfg.ablation != "no_risk_loss",
         "month_feature": cfg.ablation != "no_month",
         "resource_state_flags": True,
     }
+    if cfg.ablation == "no_evt_strict":
+        flags["tail_sensitive_loss"] = False
     if cfg.ablation == "flat_condition":
         flags["hierarchical_condition"] = False
     return flags
 
 
 def ablation_notes(cfg: TrainConfig) -> str:
-    if cfg.ablation == "no_evt":
+    if cfg.ablation in {"no_evt", "no_evt_continuous"}:
         return "EVT continuous extreme_prob and tail_score are removed by the condition builder; tail weights fall back to severity_level only."
+    if cfg.ablation == "no_evt_strict":
+        return "The whole EVT risk layer is zeroed: extreme_prob, tail_score, and severity_level are all unavailable to the condition encoder."
     if cfg.ablation == "no_risk_loss":
         return "Risk targets remain in the condition path, but lambda_risk is forced to zero in stage 3."
     if cfg.ablation == "no_month":
@@ -180,7 +184,9 @@ def resolve_device(device_name: str) -> torch.device:
 
 
 def tail_weight(proc_risk_cond: torch.Tensor, ablation: str) -> torch.Tensor:
-    if ablation == "no_evt":
+    if ablation == "no_evt_strict":
+        return torch.ones((proc_risk_cond.size(0),), dtype=proc_risk_cond.dtype, device=proc_risk_cond.device)
+    if ablation in {"no_evt", "no_evt_continuous"}:
         severity_signal = proc_risk_cond[:, 2]
         return 1.0 + severity_signal.clamp(min=0.0)
     tail_signal = proc_risk_cond[:, 1]
@@ -311,6 +317,47 @@ def evaluate(
     return {key: value / max(count, 1) for key, value in stats.items()}
 
 
+def _risk_aware_score(val_stats: dict[str, float]) -> float:
+    return (
+        0.5 * float(val_stats.get("val_eps_loss", 0.0))
+        + 0.5 * float(val_stats.get("val_risk_loss", 0.0))
+        + 0.2 * float(val_stats.get("val_recon_loss", 0.0))
+    )
+
+
+def _build_checkpoint(
+    model: HierarchicalConditionalUNet1D,
+    cfg: TrainConfig,
+    train_ds: ConditionedWindowDataset,
+    cond_normalizers,
+    risk_norm_np: dict[str, np.float32],
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    bg_dim: int,
+    proc_dim: int,
+    risk_dim: int,
+    flat_condition: bool,
+    epoch: int,
+    stage: str,
+    checkpoint_type: str,
+) -> dict:
+    return {
+        "model_state": model.state_dict(),
+        "train_config": asdict(cfg),
+        "condition_meta": train_ds.condition_meta,
+        "condition_normalizers": asdict(cond_normalizers),
+        "risk_normalization": {k: float(v) for k, v in risk_norm_np.items()},
+        "x_mean": x_mean,
+        "x_std": x_std,
+        "seq_len": cfg.seq_len,
+        "cond_dims": {"background": bg_dim, "process": proc_dim, "risk": risk_dim},
+        "flat_condition": flat_condition,
+        "checkpoint_type": checkpoint_type,
+        "checkpoint_epoch": int(epoch),
+        "checkpoint_stage": stage,
+    }
+
+
 def train_model(cfg: TrainConfig) -> dict:
     set_seed(cfg.seed)
     torch.set_num_threads(1)
@@ -392,6 +439,11 @@ def train_model(cfg: TrainConfig) -> dict:
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     best_val = float("inf")
+    best_model_epoch: int | None = None
+    best_model_stage: str | None = None
+    best_risk_score = float("inf")
+    best_risk_model_epoch: int | None = None
+    best_risk_model_stage: str | None = None
     history_rows: list[dict[str, float | str | int]] = []
     total_epochs = cfg.stage1_epochs + cfg.stage2_epochs + cfg.stage3_epochs
     if total_epochs <= 0:
@@ -428,19 +480,49 @@ def train_model(cfg: TrainConfig) -> dict:
 
         if val_stats["val_total_loss"] < best_val:
             best_val = val_stats["val_total_loss"]
-            checkpoint = {
-                "model_state": ema_model.state_dict(),
-                "train_config": asdict(cfg),
-                "condition_meta": train_ds.condition_meta,
-                "condition_normalizers": asdict(cond_normalizers),
-                "risk_normalization": {k: float(v) for k, v in risk_norm_np.items()},
-                "x_mean": x_mean,
-                "x_std": x_std,
-                "seq_len": cfg.seq_len,
-                "cond_dims": {"background": bg_dim, "process": proc_dim, "risk": risk_dim},
-                "flat_condition": flat_condition,
-            }
+            best_model_epoch = epoch
+            best_model_stage = stage
+            checkpoint = _build_checkpoint(
+                ema_model,
+                cfg,
+                train_ds,
+                cond_normalizers,
+                risk_norm_np,
+                x_mean,
+                x_std,
+                bg_dim,
+                proc_dim,
+                risk_dim,
+                flat_condition,
+                epoch,
+                stage,
+                "best",
+            )
             torch.save(checkpoint, out_dir / "best_model.pt")
+
+        risk_score = _risk_aware_score(val_stats)
+        risk_model_allowed = stage == "stage3_risk" and cfg.ablation != "no_risk_loss" and cfg.lambda_risk > 0
+        if risk_model_allowed and risk_score < best_risk_score:
+            best_risk_score = risk_score
+            best_risk_model_epoch = epoch
+            best_risk_model_stage = stage
+            risk_checkpoint = _build_checkpoint(
+                ema_model,
+                cfg,
+                train_ds,
+                cond_normalizers,
+                risk_norm_np,
+                x_mean,
+                x_std,
+                bg_dim,
+                proc_dim,
+                risk_dim,
+                flat_condition,
+                epoch,
+                stage,
+                "best-risk",
+            )
+            torch.save(risk_checkpoint, out_dir / "best_risk_model.pt")
 
         if epoch == 1 or epoch % 5 == 0 or epoch == total_epochs:
             print(
@@ -453,6 +535,24 @@ def train_model(cfg: TrainConfig) -> dict:
     history_df = pd.DataFrame(history_rows)
     history_df.to_csv(out_dir / "training_history.csv", index=False, encoding="utf-8-sig")
     plot_history(history_df, out_dir / "loss_curve.png")
+
+    final_checkpoint = _build_checkpoint(
+        ema_model,
+        cfg,
+        train_ds,
+        cond_normalizers,
+        risk_norm_np,
+        x_mean,
+        x_std,
+        bg_dim,
+        proc_dim,
+        risk_dim,
+        flat_condition,
+        total_epochs,
+        stage_name(total_epochs, cfg),
+        "final",
+    )
+    torch.save(final_checkpoint, out_dir / "final_model.pt")
 
     condition_meta = dict(train_ds.condition_meta)
     condition_meta["cond_dims"] = {"background": bg_dim, "process": proc_dim, "risk": risk_dim}
@@ -470,6 +570,15 @@ def train_model(cfg: TrainConfig) -> dict:
         "val_size": int(len(val_ds)),
         "seq_len": cfg.seq_len,
         "best_val_loss": float(best_val),
+        "best_model_epoch": best_model_epoch,
+        "best_model_stage": best_model_stage,
+        "best_risk_model_score": None if best_risk_model_epoch is None else float(best_risk_score),
+        "best_risk_model_epoch": best_risk_model_epoch,
+        "best_risk_model_stage": best_risk_model_stage,
+        "final_epoch": int(total_epochs),
+        "final_stage": stage_name(total_epochs, cfg),
+        "lambda_risk_used": 0.0 if cfg.ablation == "no_risk_loss" else cfg.lambda_risk,
+        "checkpoint_type_used_for_generation": None,
         "stage1_epochs": cfg.stage1_epochs,
         "stage2_epochs": cfg.stage2_epochs,
         "stage3_epochs": cfg.stage3_epochs,
@@ -501,7 +610,12 @@ def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="Train the hierarchical EVT-risk diffusion model.")
     parser.add_argument("--data-dir", type=str, required=True)
     parser.add_argument("--out-dir", type=str, required=True)
-    parser.add_argument("--ablation", type=str, default="full", choices=["full", "no_evt", "no_risk_loss", "no_month", "flat_condition"])
+    parser.add_argument(
+        "--ablation",
+        type=str,
+        default="full",
+        choices=["full", "no_evt", "no_evt_continuous", "no_evt_strict", "no_risk_loss", "no_month", "flat_condition"],
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--seq-len", type=int, default=24)
     parser.add_argument("--batch-size", type=int, default=32)

@@ -25,7 +25,7 @@ class DetectConfig:
 
     freq_hours: int = 1
     min_event_hours: int = 6
-    low_resource_min_hours: int = 6
+    low_resource_min_hours: int = 3
 
     cold_temp_threshold: float = -10.0
     cold_drop_24h_threshold: float = 8.0
@@ -46,9 +46,9 @@ class DetectConfig:
     require_wind_for_snow_event: bool = False
     snow_precip_relax_ratio_with_wind: float = 0.7
 
-    low_irr_quantile: float = 0.2
-    low_wind_quantile: float = 0.2
-    daylight_irradiance_min: float = 50.0
+    low_irr_quantile: float = 0.30
+    low_wind_quantile: float = 0.30
+    daylight_irradiance_min: float = 30.0
 
 
 def _prepare_dataframe(df: pd.DataFrame, cfg: DetectConfig) -> pd.DataFrame:
@@ -283,9 +283,12 @@ def detect_extreme_samples(
             if add_buffer_hours > 0:
                 start_time, end_time = _add_buffer(core_start, core_end, add_buffer_hours)
 
-            core_sub = df[(df[cfg.time_col] >= core_start) & (df[cfg.time_col] <= core_end)]
-            low_irr_segments = _find_true_segments(low_irr_flag.loc[core_sub.index], core_sub[cfg.time_col], low_res_len)
-            low_wind_segments = _find_true_segments(low_wind_flag.loc[core_sub.index], core_sub[cfg.time_col], low_res_len)
+            # Resource-state labels describe the process around the event, so
+            # they are evaluated on the buffered event window instead of only
+            # the meteorological core interval.
+            event_sub = df[(df[cfg.time_col] >= start_time) & (df[cfg.time_col] <= end_time)]
+            low_irr_segments = _find_true_segments(low_irr_flag.loc[event_sub.index], event_sub[cfg.time_col], low_res_len)
+            low_wind_segments = _find_true_segments(low_wind_flag.loc[event_sub.index], event_sub[cfg.time_col], low_res_len)
 
             windows.append(
                 {

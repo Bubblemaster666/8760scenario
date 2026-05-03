@@ -10,6 +10,7 @@ import pandas as pd
 
 from Extreme_Extract import DetectConfig, detect_extreme_samples
 from evt_fit import EVTConfig, fit_evt_and_label
+from risk_screening import RiskScreenConfig, screen_risk_samples
 from sample_metrics import MetricConfig, compute_metrics_for_samples
 
 
@@ -115,6 +116,8 @@ def build_event_samples(
     detect_cfg: Optional[DetectConfig] = None,
     metric_cfg: Optional[MetricConfig] = None,
     evt_cfg: Optional[EVTConfig] = None,
+    risk_screen_cfg: Optional[RiskScreenConfig] = None,
+    intermediate_output_dir: str | Path | None = None,
     add_buffer_hours: int = 2,
     merge_overlap: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -122,6 +125,8 @@ def build_event_samples(
     detect_cfg = detect_cfg or _build_detect_config(mapping)
     metric_cfg = metric_cfg or _build_metric_config(mapping)
     evt_cfg = evt_cfg or EVTConfig(metric_col="cum_deficit")
+    risk_screen_cfg = risk_screen_cfg or RiskScreenConfig()
+    intermediate_dir = Path(intermediate_output_dir) if intermediate_output_dir is not None else None
 
     samples = detect_extreme_samples(
         df=df,
@@ -130,7 +135,28 @@ def build_event_samples(
         merge_overlap=merge_overlap,
     )
     samples = compute_metrics_for_samples(df=df, samples=samples, cfg=metric_cfg)
-    labeled, evt_info = fit_evt_and_label(samples=samples, cfg=evt_cfg)
+    if intermediate_dir is not None:
+        intermediate_dir.mkdir(parents=True, exist_ok=True)
+        tau_diagnostic = samples.attrs.get("tau_diagnostic")
+        if isinstance(tau_diagnostic, pd.DataFrame):
+            tau_diagnostic.to_csv(intermediate_dir / "tau_diagnostic.csv", index=False, encoding="utf-8-sig")
+    screened, risk_screen_summary = screen_risk_samples(
+        samples=samples,
+        cfg=risk_screen_cfg,
+        output_dir=intermediate_dir,
+    )
+    labeled, evt_info = fit_evt_and_label(samples=screened, cfg=evt_cfg)
+    risk_screen_summary["severity_counts_after"] = {
+        str(k): int(v)
+        for k, v in labeled.get("severity_level", pd.Series(dtype=int)).fillna(0).astype(int).value_counts().sort_index().items()
+    }
+    if intermediate_dir is not None:
+        labeled.to_csv(intermediate_dir / "samples_after_risk_screen_labeled.csv", index=False, encoding="utf-8-sig")
+        (intermediate_dir / "risk_screen_summary.json").write_text(
+            json.dumps(risk_screen_summary, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+    evt_info["risk_screening"] = risk_screen_summary
     return labeled, evt_info
 
 
@@ -211,6 +237,8 @@ def build_dataset_artifacts(
                 "netload_ramp_max": float(row.get("netload_ramp_max", np.nan)),
                 "imbalance_duration": float(row.get("imbalance_duration", np.nan)),
                 "imbalance_tau": float(row.get("imbalance_tau", 0.0)),
+                "imbalance_tau_mode": row.get("imbalance_tau_mode", np.nan),
+                "delta_t_hours": float(row.get("delta_t_hours", 1.0)),
             }
         )
         meta_rows.append(

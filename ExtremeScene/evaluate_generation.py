@@ -10,8 +10,9 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.distance import jensenshannon
 from scipy.stats import wasserstein_distance
+from scipy.stats import genpareto
 
-from evt_fit import EVTConfig, fit_evt_and_label
+from evt_fit import prob_to_level
 from risk_metrics import batch_hard_risk_metrics
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans"]
@@ -27,6 +28,7 @@ class EvalConfig:
     out_dir: str
     model_name: str
     max_lag: int = 12
+    severity_info: str | None = None
 
 
 def _load_inputs(cfg: EvalConfig) -> tuple[np.ndarray, np.ndarray, pd.DataFrame, pd.DataFrame]:
@@ -81,17 +83,93 @@ def _mean_corr_matrix(samples: np.ndarray) -> np.ndarray:
     return np.mean(mats, axis=0)
 
 
-def _severity_match_rate(cond: pd.DataFrame, generated_cum: np.ndarray) -> tuple[float, float]:
-    gen_df = pd.DataFrame({"cum_deficit": generated_cum})
-    labeled, _ = fit_evt_and_label(gen_df, EVTConfig(metric_col="cum_deficit"))
-    gen_level = labeled["severity_level"].fillna(0).astype(int).to_numpy()
+def _load_severity_info(cfg: EvalConfig) -> dict:
+    if cfg.severity_info:
+        path = Path(cfg.severity_info)
+    else:
+        path = Path(cfg.cond).parent / "dataset_summary.json"
+    if not path.exists():
+        return {"method": "condition_severity_thresholds_fallback", "source": "cond.csv"}
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"method": "condition_severity_thresholds_fallback", "source": str(path)}
+    evt_info = summary.get("evt_info", {})
+    return {"method": "dataset_evt_info", "source": str(path), "evt_info": evt_info}
+
+
+def _levels_from_evt_info(generated_cum: np.ndarray, severity_info: dict) -> tuple[np.ndarray | None, str]:
+    evt_info = severity_info.get("evt_info", {})
+    severity_mode = str(evt_info.get("severity_mode", "")).lower()
+    severity_quantiles = evt_info.get("severity_quantiles", {})
+    if severity_mode in {"quantile", "hybrid"} and all(k in severity_quantiles for k in ["q1", "q2", "q3"]):
+        q1 = float(severity_quantiles["q1"])
+        q2 = float(severity_quantiles["q2"])
+        q3 = float(severity_quantiles["q3"])
+        if np.isfinite(q1) and np.isfinite(q2) and np.isfinite(q3):
+            values = np.asarray(generated_cum, dtype=float)
+            levels = np.zeros((len(values),), dtype=int)
+            levels = np.where(values >= q1, 1, levels)
+            levels = np.where(values >= q2, 2, levels)
+            levels = np.where(values >= q3, 3, levels)
+            if bool(severity_quantiles.get("positive_only", False)):
+                levels = np.where(values <= 0, 0, levels)
+            return levels.astype(int), f"dataset_evt_info_{severity_mode}_quantiles"
+
+    thresholds = evt_info.get("severity_thresholds", {})
+    required = {"threshold_u", "shape_c", "scale", "tail_prob_at_u"}
+    if evt_info.get("method") != "pot_gpd" or not required.issubset(evt_info):
+        return None, "condition_severity_thresholds_fallback"
+
+    threshold_u = float(evt_info["threshold_u"])
+    shape_c = float(evt_info["shape_c"])
+    scale = float(evt_info["scale"])
+    tail_prob_at_u = float(evt_info["tail_prob_at_u"])
+    severe_prob = float(thresholds.get("severe_prob", 0.01))
+    moderate_prob = float(thresholds.get("moderate_prob", 0.05))
+    mild_prob = float(thresholds.get("mild_prob", 0.10))
+
+    levels = []
+    for value in generated_cum:
+        if not np.isfinite(value):
+            levels.append(0)
+            continue
+        if value <= threshold_u:
+            prob = 1.0
+        else:
+            exceedance = float(value - threshold_u)
+            tail_cond = 1.0 - genpareto.cdf(exceedance, c=shape_c, loc=0.0, scale=scale)
+            prob = float(np.clip(tail_prob_at_u * tail_cond, 1e-8, 1.0))
+        levels.append(prob_to_level(prob, severe_prob, moderate_prob, mild_prob))
+    return np.asarray(levels, dtype=int), "dataset_evt_info_pot_gpd"
+
+
+def _levels_from_condition_thresholds(cond: pd.DataFrame, generated_cum: np.ndarray) -> np.ndarray:
+    target_level = cond["severity_level"].fillna(0).astype(int).to_numpy()
+    target_cum = cond["cum_deficit"].fillna(0).astype(float).to_numpy()
+    thresholds: dict[int, float] = {}
+    for level in [1, 2, 3]:
+        mask = target_level >= level
+        if np.any(mask):
+            thresholds[level] = float(np.min(target_cum[mask]))
+
+    levels = np.zeros((len(generated_cum),), dtype=int)
+    for level, threshold in thresholds.items():
+        levels = np.where(generated_cum >= threshold, level, levels)
+    return levels
+
+
+def _severity_match_rate(cond: pd.DataFrame, generated_cum: np.ndarray, severity_info: dict) -> tuple[float, float, str]:
+    gen_level, method = _levels_from_evt_info(generated_cum, severity_info)
+    if gen_level is None:
+        gen_level = _levels_from_condition_thresholds(cond, generated_cum)
     target = cond["severity_level"].fillna(0).astype(int).to_numpy()
     exact = float(np.mean(gen_level == target))
     adjacent = float(np.mean(np.abs(gen_level - target) <= 1))
-    return exact, adjacent
+    return exact, adjacent, method
 
 
-def compute_metrics(real: np.ndarray, gen: np.ndarray, cond: pd.DataFrame, max_lag: int) -> dict[str, float]:
+def compute_metrics(real: np.ndarray, gen: np.ndarray, cond: pd.DataFrame, max_lag: int, severity_info: dict | None = None) -> dict[str, float | str]:
     names = ["load", "wind_power", "solar_power"]
     metrics: dict[str, float] = {}
     wasserstein_scores = []
@@ -138,17 +216,22 @@ def compute_metrics(real: np.ndarray, gen: np.ndarray, cond: pd.DataFrame, max_l
         metrics[f"q99_{key}_error"] = q99_err
         risk_rows.append((key, real_arr, gen_arr))
 
-    exact_match, adjacent_match = _severity_match_rate(cond, np.asarray(risk_gen["cum_deficit"], dtype=float))
+    exact_match, adjacent_match, severity_method = _severity_match_rate(
+        cond,
+        np.asarray(risk_gen["cum_deficit"], dtype=float),
+        severity_info or {"method": "condition_severity_thresholds_fallback"},
+    )
     metrics["extreme_degree_match_rate"] = exact_match
     metrics["extreme_degree_adjacent_match_rate"] = adjacent_match
+    metrics["severity_classification_method"] = severity_method
     return metrics
 
 
-def _group_metrics(real: np.ndarray, gen: np.ndarray, cond: pd.DataFrame, group_col: str, max_lag: int) -> pd.DataFrame:
+def _group_metrics(real: np.ndarray, gen: np.ndarray, cond: pd.DataFrame, group_col: str, max_lag: int, severity_info: dict) -> pd.DataFrame:
     rows = []
     for value, sub_idx in cond.groupby(group_col).groups.items():
         idx = np.asarray(list(sub_idx), dtype=int)
-        sub_metrics = compute_metrics(real[idx], gen[idx], cond.iloc[idx].reset_index(drop=True), max_lag=max_lag)
+        sub_metrics = compute_metrics(real[idx], gen[idx], cond.iloc[idx].reset_index(drop=True), max_lag=max_lag, severity_info=severity_info)
         sub_metrics[group_col] = value
         rows.append(sub_metrics)
     return pd.DataFrame(rows)
@@ -256,13 +339,14 @@ def evaluate_generation(cfg: EvalConfig) -> dict:
     figures_dir.mkdir(parents=True, exist_ok=True)
 
     real, gen, cond, meta = _load_inputs(cfg)
-    metrics = compute_metrics(real, gen, cond, cfg.max_lag)
+    severity_info = _load_severity_info(cfg)
+    metrics = compute_metrics(real, gen, cond, cfg.max_lag, severity_info=severity_info)
     metrics["model_name"] = cfg.model_name
 
     metrics_df = pd.DataFrame([metrics])
     metrics_df.to_csv(out_dir / "metrics_summary.csv", index=False, encoding="utf-8-sig")
-    _group_metrics(real, gen, cond, "event_type", cfg.max_lag).to_csv(out_dir / "metrics_by_event_type.csv", index=False, encoding="utf-8-sig")
-    _group_metrics(real, gen, cond, "severity_level", cfg.max_lag).to_csv(out_dir / "metrics_by_severity.csv", index=False, encoding="utf-8-sig")
+    _group_metrics(real, gen, cond, "event_type", cfg.max_lag, severity_info).to_csv(out_dir / "metrics_by_event_type.csv", index=False, encoding="utf-8-sig")
+    _group_metrics(real, gen, cond, "severity_level", cfg.max_lag, severity_info).to_csv(out_dir / "metrics_by_severity.csv", index=False, encoding="utf-8-sig")
 
     risk_df = _plot_risk_boxplot(real, gen, cond, figures_dir)
     risk_df.to_csv(out_dir / "risk_metrics_real_vs_generated.csv", index=False, encoding="utf-8-sig")
@@ -273,6 +357,11 @@ def evaluate_generation(cfg: EvalConfig) -> dict:
     summary = {
         "model_name": cfg.model_name,
         "num_samples": int(len(cond)),
+        "severity_classification": {
+            "method": metrics.get("severity_classification_method"),
+            "source": severity_info.get("source"),
+            "note": "Generated samples are classified with fixed dataset EVT information when available; otherwise condition severity thresholds are used. The evaluator no longer re-fits EVT on generated samples.",
+        },
         "metrics": metrics,
     }
     (out_dir / "evaluation_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -288,6 +377,7 @@ def parse_args() -> EvalConfig:
     parser.add_argument("--model-name", type=str, required=True)
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--max-lag", type=int, default=12)
+    parser.add_argument("--severity-info", type=str, default=None)
     args = parser.parse_args()
     return EvalConfig(
         real=args.real,
@@ -297,6 +387,7 @@ def parse_args() -> EvalConfig:
         out_dir=args.out_dir,
         model_name=args.model_name,
         max_lag=args.max_lag,
+        severity_info=args.severity_info,
     )
 
 

@@ -6,7 +6,14 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from risk_metrics import RiskMetricConfig, hard_risk_metrics_from_frame, hard_risk_metrics_from_net_load
+from risk_metrics import (
+    RiskMetricConfig,
+    build_tau_diagnostic,
+    hard_risk_metrics_from_net_load,
+    month_to_season,
+    prepare_net_load_frame,
+    resolve_context_tau,
+)
 
 
 @dataclass
@@ -15,7 +22,7 @@ class MetricConfig:
     load_col: str = "load"
     wind_power_col: str = "wind_power"
     solar_power_col: str = "solar_power"
-    imbalance_tau_mode: str = "quantile"
+    imbalance_tau_mode: str = "monthly_quantile"
     imbalance_tau_fixed: float = 0.0
     imbalance_tau_quantile: float = 0.75
     freq_hours: Optional[float] = None
@@ -73,7 +80,8 @@ def compute_metrics_for_samples(
         raise ValueError(f"df is missing required columns: {sorted(missing_df_cols)}")
 
     risk_cfg = _to_risk_config(cfg)
-    prepared_df, tau, delta_t_hours = hard_risk_metrics_from_frame(df, risk_cfg)
+    prepared_df, delta_t_hours = prepare_net_load_frame(df, risk_cfg)
+    tau_diagnostic = build_tau_diagnostic(prepared_df, risk_cfg)
     out_rows = []
 
     for _, row in samples.iterrows():
@@ -85,7 +93,11 @@ def compute_metrics_for_samples(
         ].copy()
 
         rec = row.to_dict()
+        month = int(row.get("month", pd.Timestamp(row.get("core_start_time", start_time)).month))
+        season = str(row.get("season", month_to_season(month)))
+        tau = resolve_context_tau(prepared_df, risk_cfg, month=month, season=season)
         rec["imbalance_tau"] = tau
+        rec["imbalance_tau_mode"] = cfg.imbalance_tau_mode
         rec["delta_t_hours"] = delta_t_hours
 
         if sub.empty:
@@ -105,7 +117,9 @@ def compute_metrics_for_samples(
         rec.update(metrics)
         out_rows.append(rec)
 
-    return pd.DataFrame(out_rows)
+    out = pd.DataFrame(out_rows)
+    out.attrs["tau_diagnostic"] = tau_diagnostic
+    return out
 
 
 if __name__ == "__main__":

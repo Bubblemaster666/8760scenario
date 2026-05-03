@@ -16,7 +16,9 @@ from data_interface import (
     build_dataset_artifacts,
     build_event_samples,
 )
+from diagnose_extreme_samples import run_diagnostics
 from evt_fit import EVTConfig
+from risk_screening import RiskScreenConfig
 from run_experiments import ExperimentConfig, run_experiments
 from sample_metrics import MetricConfig
 
@@ -45,6 +47,25 @@ class PaperPipelineConfig:
     plain_epochs: int | None = None
     gan_epochs: int | None = None
     seed: int = 42
+    low_irr_quantile: float = 0.30
+    low_wind_quantile: float = 0.30
+    low_resource_min_hours: int = 3
+    daylight_irradiance_min: float = 30.0
+    risk_screen_enabled: bool = True
+    risk_screen_mode: str = "medium"
+    min_cum_deficit: float = 0.0
+    min_imbalance_duration: float = 1.0
+    ramp_quantile: float = 0.70
+    imbalance_tau_mode: str = "monthly_quantile"
+    imbalance_tau_quantile: float = 0.75
+    imbalance_tau_fixed: float = 0.0
+    severity_mode: str = "hybrid"
+    severity_q1: float = 0.60
+    severity_q2: float = 0.80
+    severity_q3: float = 0.92
+    drop_rare_event_types: bool = False
+    min_event_type_count: int = 5
+    skip_model_experiments: bool = False
 
 
 def _build_mock_timeseries(cfg: PaperPipelineConfig) -> pd.DataFrame:
@@ -80,14 +101,20 @@ def _load_real_timeseries(cfg: PaperPipelineConfig) -> pd.DataFrame:
 
 
 def _build_detect_config(cfg: PaperPipelineConfig) -> DetectConfig | None:
+    common = {
+        "low_irr_quantile": cfg.low_irr_quantile,
+        "low_wind_quantile": cfg.low_wind_quantile,
+        "low_resource_min_hours": cfg.low_resource_min_hours,
+        "daylight_irradiance_min": cfg.daylight_irradiance_min,
+    }
     if cfg.use_mock:
-        return None
+        return DetectConfig(**common)
     # Real singleton data has much milder temperature and wind ranges than the
     # original mock assumptions, so we switch to quantile-adaptive thresholds.
     return DetectConfig(
+        **common,
         use_adaptive_thresholds=True,
         min_event_hours=6,
-        low_resource_min_hours=6,
         cold_temp_quantile=0.10,
         cold_drop_24h_quantile=0.95,
         adaptive_cold_drop_min=4.5,
@@ -114,11 +141,45 @@ def run_pipeline(cfg: PaperPipelineConfig) -> dict:
         timeseries_df,
         column_mapping=column_mapping,
         detect_cfg=detect_cfg,
-        metric_cfg=MetricConfig(),
-        evt_cfg=EVTConfig(metric_col="cum_deficit", threshold_quantile=0.90),
+        metric_cfg=MetricConfig(
+            imbalance_tau_mode=cfg.imbalance_tau_mode,
+            imbalance_tau_quantile=cfg.imbalance_tau_quantile,
+            imbalance_tau_fixed=cfg.imbalance_tau_fixed,
+        ),
+        evt_cfg=EVTConfig(
+            metric_col="cum_deficit",
+            threshold_quantile=0.90,
+            severity_mode=cfg.severity_mode,
+            severity_q1=cfg.severity_q1,
+            severity_q2=cfg.severity_q2,
+            severity_q3=cfg.severity_q3,
+        ),
+        risk_screen_cfg=RiskScreenConfig(
+            enabled=cfg.risk_screen_enabled,
+            mode=cfg.risk_screen_mode,
+            min_cum_deficit=cfg.min_cum_deficit,
+            min_imbalance_duration=cfg.min_imbalance_duration,
+            ramp_quantile=cfg.ramp_quantile,
+        ),
+        intermediate_output_dir=dataset_dir,
         add_buffer_hours=2,
         merge_overlap=False,
     )
+    rare_event_summary = None
+    if cfg.drop_rare_event_types and not samples_labeled.empty:
+        counts = samples_labeled["event_type"].value_counts()
+        keep_types = counts[counts >= int(cfg.min_event_type_count)].index
+        before_count = int(len(samples_labeled))
+        samples_labeled = samples_labeled[samples_labeled["event_type"].isin(keep_types)].reset_index(drop=True)
+        samples_labeled["sample_id"] = [f"S{i:04d}" for i in range(1, len(samples_labeled) + 1)]
+        rare_event_summary = {
+            "enabled": True,
+            "min_event_type_count": int(cfg.min_event_type_count),
+            "before_count": before_count,
+            "after_count": int(len(samples_labeled)),
+            "kept_event_types": [str(x) for x in keep_types],
+            "dropped_event_type_counts": {str(k): int(v) for k, v in counts[counts < int(cfg.min_event_type_count)].to_dict().items()},
+        }
     samples_labeled.to_csv(dataset_dir / "samples_evt_labeled.csv", index=False, encoding="utf-8-sig")
 
     dataset_result = build_dataset_artifacts(
@@ -135,8 +196,29 @@ def run_pipeline(cfg: PaperPipelineConfig) -> dict:
         extra_summary={
             "source": "mock" if cfg.use_mock else "real",
             "detect_cfg": asdict(detect_cfg) if detect_cfg is not None else "default_mock_thresholds",
+            "metric_cfg": asdict(
+                MetricConfig(
+                    imbalance_tau_mode=cfg.imbalance_tau_mode,
+                    imbalance_tau_quantile=cfg.imbalance_tau_quantile,
+                    imbalance_tau_fixed=cfg.imbalance_tau_fixed,
+                )
+            ),
+            "risk_screen_cfg": asdict(
+                RiskScreenConfig(
+                    enabled=cfg.risk_screen_enabled,
+                    mode=cfg.risk_screen_mode,
+                    min_cum_deficit=cfg.min_cum_deficit,
+                    min_imbalance_duration=cfg.min_imbalance_duration,
+                    ramp_quantile=cfg.ramp_quantile,
+                )
+            ),
+            "rare_event_filter": rare_event_summary or {
+                "enabled": False,
+                "min_event_type_count": int(cfg.min_event_type_count),
+            },
         },
     )
+    diagnostic_summary = run_diagnostics(dataset_dir / "samples_evt_labeled.csv", out_dir / "diagnostics")
 
     stage1_epochs = cfg.stage1_epochs if cfg.stage1_epochs is not None else 12
     stage2_epochs = cfg.stage2_epochs if cfg.stage2_epochs is not None else 10
@@ -144,33 +226,37 @@ def run_pipeline(cfg: PaperPipelineConfig) -> dict:
     plain_epochs = cfg.plain_epochs if cfg.plain_epochs is not None else (12 if cfg.use_mock else 40)
     gan_epochs = cfg.gan_epochs if cfg.gan_epochs is not None else (12 if cfg.use_mock else 40)
 
-    experiment_cfg = ExperimentConfig(
-        data_dir=str(dataset_dir),
-        out_dir=str(out_dir),
-        methods=[
-            "traditional_gaussian_copula",
-            "plain_diffusion_baseline",
-            "enhanced_gan",
-            "proposed",
-            "no_evt",
-            "no_risk_loss",
-            "no_month",
-            "flat_condition",
-        ],
-        seq_len=cfg.seq_len,
-        stage1_epochs=stage1_epochs,
-        stage2_epochs=stage2_epochs,
-        stage3_epochs=stage3_epochs,
-        batch_size=cfg.batch_size,
-        diffusion_steps=cfg.diffusion_steps,
-        base_channels=cfg.base_channels,
-        plain_epochs=plain_epochs,
-        gan_epochs=gan_epochs,
-        device="cpu",
-        guidance_scale=1.0,
-        seed=cfg.seed,
-    )
-    all_metrics = run_experiments(experiment_cfg)
+    if cfg.skip_model_experiments:
+        all_metrics = pd.DataFrame()
+    else:
+        experiment_cfg = ExperimentConfig(
+            data_dir=str(dataset_dir),
+            out_dir=str(out_dir),
+            methods=[
+                "traditional_gaussian_copula",
+                "plain_diffusion_baseline",
+                "enhanced_gan",
+                "proposed",
+                "no_evt_strict",
+                "no_evt",
+                "no_risk_loss",
+                "no_month",
+                "flat_condition",
+            ],
+            seq_len=cfg.seq_len,
+            stage1_epochs=stage1_epochs,
+            stage2_epochs=stage2_epochs,
+            stage3_epochs=stage3_epochs,
+            batch_size=cfg.batch_size,
+            diffusion_steps=cfg.diffusion_steps,
+            base_channels=cfg.base_channels,
+            plain_epochs=plain_epochs,
+            gan_epochs=gan_epochs,
+            device="cpu",
+            guidance_scale=1.0,
+            seed=cfg.seed,
+        )
+        all_metrics = run_experiments(experiment_cfg)
 
     annual_summary = None
     if cfg.run_annual_embedding:
@@ -190,10 +276,11 @@ def run_pipeline(cfg: PaperPipelineConfig) -> dict:
         "config": asdict(cfg),
         "real_data_files": list(cfg.real_data_csv or ()),
         "dataset_summary": dataset_result["summary"],
+        "diagnostic_summary": diagnostic_summary,
         "all_model_metrics_path": str(out_dir / "evaluations" / "all_model_metrics.csv"),
         "annual_embedding_ran": bool(cfg.run_annual_embedding),
         "annual_embedding_summary": annual_summary,
-        "model_names": all_metrics["model_name"].tolist(),
+        "model_names": all_metrics["model_name"].tolist() if "model_name" in all_metrics.columns else [],
     }
     (out_dir / "pipeline_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
@@ -218,6 +305,25 @@ def parse_args() -> PaperPipelineConfig:
     parser.add_argument("--plain-epochs", type=int, default=None)
     parser.add_argument("--gan-epochs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--low-irr-quantile", type=float, default=0.30)
+    parser.add_argument("--low-wind-quantile", type=float, default=0.30)
+    parser.add_argument("--low-resource-min-hours", type=int, default=3)
+    parser.add_argument("--daylight-irradiance-min", type=float, default=30.0)
+    parser.add_argument("--risk-screen-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--risk-screen-mode", type=str, default="medium", choices=["loose", "medium", "strict", "hybrid"])
+    parser.add_argument("--min-cum-deficit", type=float, default=0.0)
+    parser.add_argument("--min-imbalance-duration", type=float, default=1.0)
+    parser.add_argument("--ramp-quantile", type=float, default=0.70)
+    parser.add_argument("--imbalance-tau-mode", type=str, default="monthly_quantile", choices=["global_quantile", "monthly_quantile", "seasonal_quantile", "fixed", "quantile"])
+    parser.add_argument("--imbalance-tau-quantile", type=float, default=0.75)
+    parser.add_argument("--imbalance-tau-fixed", type=float, default=0.0)
+    parser.add_argument("--severity-mode", type=str, default="hybrid", choices=["evt_prob", "quantile", "hybrid"])
+    parser.add_argument("--severity-q1", type=float, default=0.60)
+    parser.add_argument("--severity-q2", type=float, default=0.80)
+    parser.add_argument("--severity-q3", type=float, default=0.92)
+    parser.add_argument("--drop-rare-event-types", action="store_true")
+    parser.add_argument("--min-event-type-count", type=int, default=5)
+    parser.add_argument("--skip-model-experiments", action="store_true")
     args = parser.parse_args()
     return PaperPipelineConfig(
         out_dir=args.out_dir,
@@ -237,6 +343,25 @@ def parse_args() -> PaperPipelineConfig:
         plain_epochs=args.plain_epochs,
         gan_epochs=args.gan_epochs,
         seed=args.seed,
+        low_irr_quantile=args.low_irr_quantile,
+        low_wind_quantile=args.low_wind_quantile,
+        low_resource_min_hours=args.low_resource_min_hours,
+        daylight_irradiance_min=args.daylight_irradiance_min,
+        risk_screen_enabled=args.risk_screen_enabled,
+        risk_screen_mode=args.risk_screen_mode,
+        min_cum_deficit=args.min_cum_deficit,
+        min_imbalance_duration=args.min_imbalance_duration,
+        ramp_quantile=args.ramp_quantile,
+        imbalance_tau_mode=args.imbalance_tau_mode,
+        imbalance_tau_quantile=args.imbalance_tau_quantile,
+        imbalance_tau_fixed=args.imbalance_tau_fixed,
+        severity_mode=args.severity_mode,
+        severity_q1=args.severity_q1,
+        severity_q2=args.severity_q2,
+        severity_q3=args.severity_q3,
+        drop_rare_event_types=args.drop_rare_event_types,
+        min_event_type_count=args.min_event_type_count,
+        skip_model_experiments=args.skip_model_experiments,
     )
 
 

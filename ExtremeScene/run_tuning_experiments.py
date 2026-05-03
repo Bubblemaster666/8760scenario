@@ -12,15 +12,21 @@ from generate_scenarios import GenerationConfig, generate_from_checkpoint
 from train_hierarchical_evt_diffusion import TrainConfig, train_model
 
 
-RANK_WEIGHTS = {
+RISK_RANK_WEIGHTS = {
     "cum_deficit_mae": 2.0,
+    "q95_cum_deficit_error": 1.5,
     "q99_cum_deficit_error": 2.0,
-    "mean_wasserstein": 1.0,
-    "mean_js": 1.0,
-    "acf_mae": 1.0,
-    "corr_matrix_error": 1.0,
-    "netload_ramp_max_mae": 0.8,
-    "imbalance_duration_mae": 0.8,
+    "netload_ramp_max_mae": 1.0,
+    "imbalance_duration_mae": 1.0,
+    "extreme_degree_match_rate": 1.0,
+    "extreme_degree_adjacent_match_rate": 0.5,
+}
+
+STAT_TOLERANCE = {
+    "mean_wasserstein": 0.25,
+    "mean_js": 0.25,
+    "acf_mae": 0.30,
+    "corr_matrix_error": 0.30,
 }
 
 
@@ -116,26 +122,45 @@ def parse_args() -> TuningConfig:
 def add_rank_score(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     ok_mask = out["status"].eq("ok") if "status" in out.columns else pd.Series(True, index=out.index)
-    rank_cols: list[str] = []
-    for metric, weight in RANK_WEIGHTS.items():
+    weighted_cols: list[str] = []
+    for metric, weight in RISK_RANK_WEIGHTS.items():
         if metric not in out.columns:
             continue
         values = pd.to_numeric(out[metric], errors="coerce")
         rank_col = f"{metric}_rank"
-        out[rank_col] = values[ok_mask].rank(method="min", ascending=True)
+        ascending = metric not in {"extreme_degree_match_rate", "extreme_degree_adjacent_match_rate"}
+        out[rank_col] = values[ok_mask].rank(method="min", ascending=ascending)
         out.loc[~ok_mask, rank_col] = pd.NA
-        rank_cols.append(rank_col)
         out[f"{metric}_weighted_rank"] = out[rank_col] * weight
+        weighted_cols.append(f"{metric}_weighted_rank")
 
-    weighted_cols = [f"{metric}_weighted_rank" for metric in RANK_WEIGHTS if f"{metric}_weighted_rank" in out.columns]
-    total_weight = sum(weight for metric, weight in RANK_WEIGHTS.items() if f"{metric}_weighted_rank" in out.columns)
+    total_weight = sum(weight for metric, weight in RISK_RANK_WEIGHTS.items() if f"{metric}_weighted_rank" in out.columns)
     if weighted_cols and total_weight > 0:
-        out["rank_score"] = out[weighted_cols].sum(axis=1, min_count=1) / total_weight
-        out.loc[~ok_mask, "rank_score"] = pd.NA
-        out["rank_score_rank"] = pd.to_numeric(out["rank_score"], errors="coerce").rank(method="min", ascending=True)
+        out["risk_rank_score"] = out[weighted_cols].sum(axis=1, min_count=1) / total_weight
     else:
-        out["rank_score"] = pd.NA
-        out["rank_score_rank"] = pd.NA
+        out["risk_rank_score"] = pd.NA
+
+    penalty = pd.Series(0.0, index=out.index)
+    degradation_max = pd.Series(0.0, index=out.index)
+    for metric, tolerance in STAT_TOLERANCE.items():
+        if metric not in out.columns:
+            continue
+        values = pd.to_numeric(out[metric], errors="coerce")
+        best = values[ok_mask].min()
+        if pd.isna(best):
+            continue
+        degradation = (values - best) / (abs(float(best)) + 1e-8)
+        excess = (degradation - tolerance).clip(lower=0.0)
+        out[f"{metric}_degradation"] = degradation
+        penalty = penalty.add(excess.fillna(0.0), fill_value=0.0)
+        degradation_max = pd.concat([degradation_max, excess.fillna(0.0)], axis=1).max(axis=1)
+
+    out["statistical_penalty"] = penalty
+    out["statistical_degradation_score"] = degradation_max
+    out["final_risk_oriented_score"] = pd.to_numeric(out["risk_rank_score"], errors="coerce") + out["statistical_penalty"]
+    out["rank_score"] = out["final_risk_oriented_score"]
+    out.loc[~ok_mask, ["risk_rank_score", "statistical_penalty", "final_risk_oriented_score", "rank_score"]] = pd.NA
+    out["rank_score_rank"] = pd.to_numeric(out["rank_score"], errors="coerce").rank(method="min", ascending=True)
     return out
 
 
@@ -174,13 +199,15 @@ def run_one_variant(cfg: TuningConfig, preset: TuningPreset) -> dict[str, object
     )
 
     train_summary = train_model(train_cfg)
+    checkpoint_type = "best-risk" if preset.stage3_epochs > 0 and preset.lambda_risk > 0 else "best"
     generate_from_checkpoint(
         GenerationConfig(
-            checkpoint=str(variant_dir / "best_model.pt"),
+            checkpoint=None,
             data_dir=str(data_dir),
             out_dir=str(variant_dir),
             split="test",
             guidance_scale=preset.guidance_scale,
+            checkpoint_type=checkpoint_type,
         )
     )
     eval_summary = evaluate_generation(
@@ -217,7 +244,12 @@ def run_one_variant(cfg: TuningConfig, preset: TuningPreset) -> dict[str, object
         "ema_decay": cfg.ema_decay,
         "learning_rate": cfg.learning_rate,
         "weight_decay": cfg.weight_decay,
+        "checkpoint_type_used_for_generation": checkpoint_type,
         "best_val_loss": train_summary.get("best_val_loss"),
+        "best_model_epoch": train_summary.get("best_model_epoch"),
+        "best_model_stage": train_summary.get("best_model_stage"),
+        "best_risk_model_epoch": train_summary.get("best_risk_model_epoch"),
+        "best_risk_model_stage": train_summary.get("best_risk_model_stage"),
         "variant_dir": str(variant_dir),
     }
     row.update(eval_summary["metrics"])
@@ -228,7 +260,17 @@ def run_tuning(cfg: TuningConfig) -> pd.DataFrame:
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "tuning_config.json").write_text(
-        json.dumps({"config": asdict(cfg), "presets": {name: asdict(preset) for name, preset in PRESETS.items()}, "rank_weights": RANK_WEIGHTS}, ensure_ascii=False, indent=2),
+        json.dumps(
+            {
+                "config": asdict(cfg),
+                "presets": {name: asdict(preset) for name, preset in PRESETS.items()},
+                "risk_rank_weights": RISK_RANK_WEIGHTS,
+                "statistical_tolerance": STAT_TOLERANCE,
+                "selection_logic": "risk_rank_score plus statistical_penalty; lower final_risk_oriented_score is better",
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
 

@@ -102,9 +102,12 @@ def build_condition_bundle(
     if ablation == "no_month":
         month_slice = slice(event_onehot.shape[1], event_onehot.shape[1] + 2)
         bg[:, month_slice] = 0.0
-    if ablation == "no_evt":
+    if ablation in {"no_evt", "no_evt_continuous"}:
         # Keep severity as an ordinal risk hint, but remove continuous EVT features.
         risk[:, 0:2] = 0.0
+    if ablation == "no_evt_strict":
+        # Strict EVT ablation removes the whole risk layer signal.
+        risk[:, :] = 0.0
 
     day_mask = infer_day_mask(meta_df, seq_len, daylight_start_hour, daylight_end_hour)
     risk_targets = cond_df[

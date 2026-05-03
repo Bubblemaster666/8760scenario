@@ -4,87 +4,87 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Iterable
 
 
-CORE_METRICS = [
+STAT_METRICS = [
     "mean_wasserstein",
     "mean_js",
     "acf_mae",
     "corr_matrix_error",
+]
+
+RISK_LOWER_BETTER = [
     "cum_deficit_mae",
+    "q95_cum_deficit_error",
+    "q99_cum_deficit_error",
     "netload_ramp_max_mae",
     "imbalance_duration_mae",
 ]
 
-COMPARE_ORDER = [
+RISK_HIGHER_BETTER = [
+    "extreme_degree_match_rate",
+    "extreme_degree_adjacent_match_rate",
+]
+
+RISK_WEIGHTS = {
+    "cum_deficit_mae": 2.0,
+    "q95_cum_deficit_error": 1.5,
+    "q99_cum_deficit_error": 2.0,
+    "netload_ramp_max_mae": 1.0,
+    "imbalance_duration_mae": 1.0,
+    "extreme_degree_match_rate": 1.0,
+    "extreme_degree_adjacent_match_rate": 0.5,
+}
+
+STAT_TOLERANCE = {
+    "mean_wasserstein": 0.25,
+    "mean_js": 0.25,
+    "acf_mae": 0.30,
+    "corr_matrix_error": 0.30,
+}
+
+MAIN_COMPARE_ORDER = [
     "traditional_gaussian_copula",
     "plain_diffusion_baseline",
+    "st_cdiff",
+    "improved_diffusion",
     "enhanced_gan",
     "proposed",
+]
+
+ABLATION_ORDER = [
+    "proposed",
+    "no_evt_strict",
+    "no_evt_continuous",
     "no_evt",
     "no_risk_loss",
     "no_month",
     "flat_condition",
 ]
 
-KEY_COMPARE_ROWS = [
+BASELINE_NAMES = {
     "traditional_gaussian_copula",
+    "traditional_baseline",
     "plain_diffusion_baseline",
+    "conditional_ddpm",
+    "st_cdiff",
+    "improved_diffusion",
     "enhanced_gan",
-    "proposed",
-]
-
-KEY_PROPOSED_ROWS = [
-    "proposed_g1p0",
-    "tail_only_s12_s210_s30_g1p0",
-    "risk_light_s12_s28_s34_g1p0",
-    "low_lr_risk_light_g1p0",
-]
+}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Summarize model comparison and tuning results.")
-    parser.add_argument(
-        "--compare",
-        type=Path,
-        default=Path("outputs/real_singleton_2018_2022_compare/evaluations/all_model_metrics.csv"),
-        help="Main model comparison CSV.",
-    )
-    parser.add_argument(
-        "--guidance",
-        type=Path,
-        default=Path("outputs/guidance_sweep_proposed/guidance_summary.csv"),
-        help="Guidance sweep CSV for the proposed checkpoint.",
-    )
-    parser.add_argument(
-        "--tuning",
-        type=Path,
-        default=Path("outputs/proposed_tuning_variants/tuning_summary.csv"),
-        help="Retraining variant summary CSV.",
-    )
-    parser.add_argument(
-        "--tuning-guidance",
-        type=Path,
-        default=Path("outputs/proposed_tuning_variants_guidance/summary.csv"),
-        help="Guidance sweep CSV for retrained variants.",
-    )
-    parser.add_argument(
-        "--dataset-summary",
-        type=Path,
-        default=Path("outputs/real_singleton_2018_2022_compare/dataset/dataset_summary.json"),
-        help="Optional dataset summary JSON for context.",
-    )
-    parser.add_argument(
-        "--out-dir",
-        type=Path,
-        default=Path("outputs/result_summary"),
-        help="Output directory for summary tables.",
-    )
+    parser = argparse.ArgumentParser(description="Summarize model comparison with risk-oriented paper logic.")
+    parser.add_argument("--compare", type=Path, default=Path("outputs/real_singleton_2018_2022_compare/evaluations/all_model_metrics.csv"))
+    parser.add_argument("--guidance", type=Path, default=Path("outputs/guidance_sweep_proposed/guidance_summary.csv"))
+    parser.add_argument("--tuning", type=Path, default=Path("outputs/proposed_tuning_variants/tuning_summary.csv"))
+    parser.add_argument("--tuning-guidance", type=Path, default=Path("outputs/proposed_tuning_variants_guidance/summary.csv"))
+    parser.add_argument("--dataset-summary", type=Path, default=Path("outputs/real_singleton_2018_2022_compare/dataset/dataset_summary.json"))
+    parser.add_argument("--out-dir", type=Path, default=Path("outputs/result_summary"))
     return parser.parse_args()
 
 
-def safe_float(value: str | None) -> float | None:
+def safe_float(value: object) -> float | None:
     if value is None:
         return None
     text = str(value).strip()
@@ -105,141 +105,177 @@ def read_csv_rows(path: Path) -> list[dict[str, str]]:
 
 def write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
 
 
-def normalize_row(
-    row: dict[str, str],
-    group: str,
-    experiment_name: str,
-    source_file: Path,
-    note: str = "",
-) -> dict[str, object]:
-    normalized: dict[str, object] = {
+def normalize_row(row: dict[str, str], group: str, source_file: Path, note: str = "") -> dict[str, object]:
+    name = row.get("model_name") or row.get("variant") or row.get("experiment_name") or ""
+    out: dict[str, object] = {
         "group": group,
-        "experiment_name": experiment_name,
-        "source_file": str(source_file),
+        "experiment_name": name.strip(),
+        "model_name": name.strip(),
+        "status": row.get("status", "ok"),
         "note": note,
+        "source_file": str(source_file),
     }
-    for metric in CORE_METRICS + [
-        "q95_cum_deficit_error",
-        "q99_cum_deficit_error",
-        "extreme_degree_match_rate",
-        "extreme_degree_adjacent_match_rate",
-    ]:
-        normalized[metric] = safe_float(row.get(metric))
-    return normalized
+    for metric in STAT_METRICS + RISK_LOWER_BETTER + RISK_HIGHER_BETTER:
+        out[metric] = safe_float(row.get(metric))
+    for extra in ["severity_classification_method", "checkpoint_type_used_for_generation"]:
+        if extra in row:
+            out[extra] = row[extra]
+    out["statistical_metrics"] = json.dumps({m: out.get(m) for m in STAT_METRICS}, ensure_ascii=False)
+    out["risk_metrics"] = json.dumps({m: out.get(m) for m in RISK_LOWER_BETTER + RISK_HIGHER_BETTER}, ensure_ascii=False)
+    return out
 
 
 def build_full_rows(args: argparse.Namespace) -> list[dict[str, object]]:
+    inputs = [
+        (args.compare, "main_compare", ""),
+        (args.guidance, "proposed_guidance_sweep", "same checkpoint, different guidance_scale"),
+        (args.tuning, "proposed_retrain", "retrained proposed variant"),
+        (args.tuning_guidance, "proposed_retrain_guidance", "retrained proposed variant with altered guidance_scale"),
+    ]
     rows: list[dict[str, object]] = []
-
-    for row in read_csv_rows(args.compare):
-        experiment_name = row.get("model_name", "").strip()
-        if not experiment_name:
-            continue
-        rows.append(
-            normalize_row(
-                row=row,
-                group="main_compare",
-                experiment_name=experiment_name,
-                source_file=args.compare,
-            )
-        )
-
-    for row in read_csv_rows(args.guidance):
-        experiment_name = row.get("model_name", "").strip()
-        if not experiment_name:
-            continue
-        rows.append(
-            normalize_row(
-                row=row,
-                group="proposed_guidance_sweep",
-                experiment_name=experiment_name,
-                source_file=args.guidance,
-                note="same checkpoint, different guidance_scale",
-            )
-        )
-
-    for row in read_csv_rows(args.tuning):
-        experiment_name = row.get("model_name", "").strip()
-        if not experiment_name:
-            continue
-        rows.append(
-            normalize_row(
-                row=row,
-                group="proposed_retrain",
-                experiment_name=experiment_name,
-                source_file=args.tuning,
-                note="retrained proposed variant",
-            )
-        )
-
-    for row in read_csv_rows(args.tuning_guidance):
-        experiment_name = row.get("model_name", "").strip()
-        if not experiment_name:
-            continue
-        rows.append(
-            normalize_row(
-                row=row,
-                group="proposed_retrain_guidance",
-                experiment_name=experiment_name,
-                source_file=args.tuning_guidance,
-                note="retrained proposed variant with altered guidance_scale",
-            )
-        )
-
+    for path, group, note in inputs:
+        for row in read_csv_rows(path):
+            normalized = normalize_row(row, group=group, source_file=path, note=note)
+            if normalized["experiment_name"]:
+                rows.append(normalized)
     return rows
 
 
-def attach_metric_ranks(rows: list[dict[str, object]], metrics: Iterable[str]) -> None:
-    for metric in metrics:
-        ranked = sorted(
-            [row for row in rows if isinstance(row.get(metric), float)],
-            key=lambda item: item[metric],  # type: ignore[index]
-        )
-        for idx, row in enumerate(ranked, start=1):
-            row[f"{metric}_rank"] = idx
+def _rank_values(rows: list[dict[str, object]], metric: str, ascending: bool) -> dict[int, int]:
+    values = []
+    for idx, row in enumerate(rows):
+        if row.get("status") == "failed":
+            continue
+        value = row.get(metric)
+        if isinstance(value, float):
+            values.append((idx, value))
+    values.sort(key=lambda item: item[1], reverse=not ascending)
+    ranks: dict[int, int] = {}
+    last_value: float | None = None
+    last_rank = 0
+    for pos, (idx, value) in enumerate(values, start=1):
+        if last_value is None or value != last_value:
+            last_rank = pos
+            last_value = value
+        ranks[idx] = last_rank
+    return ranks
 
+
+def _baseline_best_stats(rows: list[dict[str, object]]) -> dict[str, float]:
+    baseline_rows = [
+        row for row in rows
+        if row.get("group") == "main_compare"
+        and row.get("experiment_name") in BASELINE_NAMES
+        and row.get("status") != "failed"
+    ]
+    if not baseline_rows:
+        baseline_rows = [row for row in rows if row.get("status") != "failed" and row.get("experiment_name") != "proposed"]
+    best: dict[str, float] = {}
+    for metric in STAT_METRICS:
+        values = [row[metric] for row in baseline_rows if isinstance(row.get(metric), float)]
+        if values:
+            best[metric] = min(values)
+    return best
+
+
+def attach_risk_oriented_scores(rows: list[dict[str, object]]) -> None:
+    for metric in RISK_LOWER_BETTER:
+        ranks = _rank_values(rows, metric, ascending=True)
+        for idx, rank in ranks.items():
+            rows[idx][f"{metric}_risk_rank"] = rank
+            rows[idx][f"{metric}_weighted_rank"] = rank * RISK_WEIGHTS[metric]
+    for metric in RISK_HIGHER_BETTER:
+        ranks = _rank_values(rows, metric, ascending=False)
+        for idx, rank in ranks.items():
+            rows[idx][f"{metric}_risk_rank"] = rank
+            rows[idx][f"{metric}_weighted_rank"] = rank * RISK_WEIGHTS[metric]
+
+    total_weight = sum(RISK_WEIGHTS.values())
     for row in rows:
-        ranks = [row.get(f"{metric}_rank") for metric in metrics if row.get(f"{metric}_rank") is not None]
-        row["avg_rank_core_metrics"] = round(sum(ranks) / len(ranks), 3) if ranks else None
+        weighted_sum = 0.0
+        used_weight = 0.0
+        for metric, weight in RISK_WEIGHTS.items():
+            rank = row.get(f"{metric}_risk_rank")
+            if isinstance(rank, int):
+                weighted_sum += rank * weight
+                used_weight += weight
+        row["risk_rank_score"] = round(weighted_sum / used_weight, 4) if used_weight else None
+
+    best_stats = _baseline_best_stats(rows)
+    for row in rows:
+        penalty = 0.0
+        max_excess = 0.0
+        degradation_details = {}
+        for metric, tolerance in STAT_TOLERANCE.items():
+            value = row.get(metric)
+            best = best_stats.get(metric)
+            if not isinstance(value, float) or best is None:
+                continue
+            degradation = (value - best) / (abs(best) + 1e-8)
+            excess = max(0.0, degradation - tolerance)
+            row[f"{metric}_degradation"] = degradation
+            degradation_details[metric] = round(degradation, 4)
+            penalty += excess
+            max_excess = max(max_excess, excess)
+        row["statistical_degradation_score"] = round(max_excess, 4)
+        row["statistical_penalty"] = round(penalty, 4)
+        risk_score = row.get("risk_rank_score")
+        row["final_risk_oriented_score"] = round(float(risk_score) + penalty, 4) if isinstance(risk_score, float) else None
+        row["statistical_degradation_details"] = json.dumps(degradation_details, ensure_ascii=False)
+        row["statistical_status"] = _statistical_status(row)
+        row["recommendation_reason"] = _recommendation_reason(row)
 
 
-def select_key_rows(full_rows: list[dict[str, object]]) -> list[dict[str, object]]:
-    compare_lookup = {row["experiment_name"]: row for row in full_rows if row["group"] == "main_compare"}
-    proposed_lookup = {
-        row["experiment_name"]: row
-        for row in full_rows
-        if row["group"] in {"proposed_guidance_sweep", "proposed_retrain"}
-    }
+def _statistical_status(row: dict[str, object]) -> str:
+    penalty = float(row.get("statistical_penalty") or 0.0)
+    max_excess = float(row.get("statistical_degradation_score") or 0.0)
+    risk_score = row.get("risk_rank_score")
+    if penalty <= 1e-12:
+        return "acceptable"
+    if max_excess <= 0.35:
+        return "slightly_worse"
+    if isinstance(risk_score, float) and risk_score <= 3.0:
+        return "slightly_worse"
+    return "unacceptable"
 
-    selected: list[dict[str, object]] = []
-    for name in KEY_COMPARE_ROWS:
-        row = compare_lookup.get(name)
-        if row:
-            selected.append(row)
 
-    for name in KEY_PROPOSED_ROWS:
-        row = proposed_lookup.get(name)
-        if row and row not in selected:
-            selected.append(row)
+def _recommendation_reason(row: dict[str, object]) -> str:
+    status = row.get("statistical_status")
+    risk_score = row.get("risk_rank_score")
+    acf_excess = float(row.get("acf_mae_degradation") or 0.0) - STAT_TOLERANCE["acf_mae"]
+    if status == "unacceptable":
+        return "not recommended due to statistical degradation"
+    if isinstance(risk_score, float) and risk_score <= 3.0 and status == "acceptable":
+        return "risk metrics improved while statistical metrics remain acceptable"
+    if isinstance(risk_score, float) and risk_score <= 3.0 and status == "slightly_worse":
+        return "risk-preferred but temporal-continuity slightly worse" if acf_excess > 0 else "risk improved with slight statistical degradation"
+    if status == "acceptable":
+        return "good distribution but weak risk improvement"
+    return "risk improved but ACF degradation is too large" if acf_excess > 0 else "mixed trade-off"
 
-    return selected
+
+def sort_by_order(rows: list[dict[str, object]], order: list[str]) -> list[dict[str, object]]:
+    order_map = {name: idx for idx, name in enumerate(order)}
+    return sorted(rows, key=lambda row: order_map.get(str(row.get("experiment_name")), 999))
 
 
 def load_dataset_context(path: Path) -> dict[str, object]:
     if not path.exists():
         return {}
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
 
 
-def fmt_number(value: object) -> str:
+def fmt(value: object) -> str:
     if value is None:
         return "-"
     if isinstance(value, float):
@@ -248,102 +284,97 @@ def fmt_number(value: object) -> str:
 
 
 def markdown_table(rows: list[dict[str, object]], columns: list[str]) -> str:
-    headers = ["name" if col == "experiment_name" else col for col in columns]
     lines = [
-        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["name" if col == "experiment_name" else col for col in columns]) + " |",
         "| " + " | ".join(["---"] * len(columns)) + " |",
     ]
     for row in rows:
-        values = [fmt_number(row.get(col)) for col in columns]
-        lines.append("| " + " | ".join(values) + " |")
+        lines.append("| " + " | ".join(fmt(row.get(col)) for col in columns) + " |")
     return "\n".join(lines)
 
 
-def build_markdown(
-    dataset_context: dict[str, object],
-    compare_rows: list[dict[str, object]],
-    key_rows: list[dict[str, object]],
-) -> str:
-    lines: list[str] = ["# Result Summary", ""]
-
+def build_markdown(dataset_context: dict[str, object], main_rows: list[dict[str, object]], ablation_rows: list[dict[str, object]]) -> str:
+    lines = ["# Result Summary", ""]
     if dataset_context:
-        event_counts = dataset_context.get("event_type_counts", {})
-        split_counts = dataset_context.get("split_counts", {})
         lines.extend(
             [
                 "## Dataset Context",
                 "",
                 f"- n_samples: {dataset_context.get('n_samples', '-')}",
-                f"- split_counts: {split_counts}",
-                f"- event_type_counts: {json.dumps(event_counts, ensure_ascii=False)}",
+                f"- split_counts: {dataset_context.get('split_counts', {})}",
+                f"- event_type_counts: {json.dumps(dataset_context.get('event_type_counts', {}), ensure_ascii=False)}",
                 "",
             ]
         )
-
-    lines.extend(["## Main Comparison", ""])
-    lines.append(
-        markdown_table(
-            compare_rows,
-            ["experiment_name"] + CORE_METRICS + ["avg_rank_core_metrics"],
-        )
-    )
-    lines.append("")
-
-    lines.extend(["## Proposed Tuning Snapshot", ""])
-    lines.append(
-        markdown_table(
-            key_rows,
-            ["experiment_name"] + CORE_METRICS + ["avg_rank_core_metrics"],
-        )
-    )
-    lines.append("")
     lines.extend(
         [
-            "## Recommendation",
+            "## Evaluation Logic",
             "",
-            "- Recommended default: `proposed_g1p0` for the best overall distribution and cum_deficit trade-off without retraining.",
-            "- If you care more about ACF, ramp, and duration balance: `tail_only_s12_s210_s30_g1p0`.",
-            "- If you want stronger risk-side metrics and can accept weaker distribution fidelity: `risk_light_s12_s28_s34_g1p0`.",
+            "The proposed method is selected by a risk-first, statistics-constrained rule. Wasserstein, JS, ACF, and correlation matrix error are used to check that statistical realism is not obviously degraded; cumulative deficit, tail cumulative deficit, ramp, duration, and severity matching drive the risk-oriented score.",
+            "",
+            "## Main Comparison",
             "",
         ]
     )
+    lines.append(markdown_table(main_rows, ["experiment_name", *STAT_METRICS, "cum_deficit_mae", "q99_cum_deficit_error", "netload_ramp_max_mae", "imbalance_duration_mae", "extreme_degree_match_rate", "final_risk_oriented_score", "statistical_status", "recommendation_reason"]))
+    lines.extend(["", "## Ablation", ""])
+    lines.append(markdown_table(ablation_rows, ["experiment_name", "cum_deficit_mae", "q95_cum_deficit_error", "q99_cum_deficit_error", "netload_ramp_max_mae", "imbalance_duration_mae", "corr_matrix_error", "extreme_degree_match_rate", "final_risk_oriented_score", "recommendation_reason"]))
     return "\n".join(lines)
 
 
 def main() -> None:
     args = parse_args()
-    out_dir = args.out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    rows = build_full_rows(args)
+    attach_risk_oriented_scores(rows)
 
-    full_rows = build_full_rows(args)
-    attach_metric_ranks(full_rows, CORE_METRICS)
+    main_rows = sort_by_order(
+        [row for row in rows if row.get("group") == "main_compare" and row.get("experiment_name") in MAIN_COMPARE_ORDER],
+        MAIN_COMPARE_ORDER,
+    )
+    ablation_rows = sort_by_order(
+        [row for row in rows if row.get("group") == "main_compare" and row.get("experiment_name") in ABLATION_ORDER],
+        ABLATION_ORDER,
+    )
+    key_rows = sorted(rows, key=lambda row: float(row.get("final_risk_oriented_score") or 1e9))[:12]
 
-    compare_rows = [row for row in full_rows if row["group"] == "main_compare"]
-    compare_rows.sort(key=lambda row: COMPARE_ORDER.index(row["experiment_name"]) if row["experiment_name"] in COMPARE_ORDER else 999)
-
-    key_rows = select_key_rows(full_rows)
-
-    csv_fields = [
+    common_fields = [
         "group",
         "experiment_name",
-        *CORE_METRICS,
-        "q95_cum_deficit_error",
-        "q99_cum_deficit_error",
-        "extreme_degree_match_rate",
-        "extreme_degree_adjacent_match_rate",
-        *[f"{metric}_rank" for metric in CORE_METRICS],
-        "avg_rank_core_metrics",
+        "status",
+        "statistical_metrics",
+        "risk_metrics",
+        *STAT_METRICS,
+        *RISK_LOWER_BETTER,
+        *RISK_HIGHER_BETTER,
+        "risk_rank_score",
+        "statistical_degradation_score",
+        "statistical_penalty",
+        "final_risk_oriented_score",
+        "statistical_status",
+        "recommendation_reason",
+        "severity_classification_method",
+        "checkpoint_type_used_for_generation",
         "note",
         "source_file",
     ]
 
-    write_csv(out_dir / "complete_result_summary.csv", full_rows, csv_fields)
-    write_csv(out_dir / "main_compare_summary.csv", compare_rows, csv_fields)
-    write_csv(out_dir / "key_result_summary.csv", key_rows, csv_fields)
+    write_csv(args.out_dir / "complete_result_summary.csv", rows, common_fields)
+    write_csv(args.out_dir / "key_result_summary.csv", key_rows, common_fields)
+    write_csv(args.out_dir / "main_compare_summary.csv", main_rows, common_fields)
+    write_csv(
+        args.out_dir / "main_compare_paper_table.csv",
+        main_rows,
+        ["experiment_name", *STAT_METRICS, "cum_deficit_mae", "q99_cum_deficit_error", "netload_ramp_max_mae", "imbalance_duration_mae", "extreme_degree_match_rate", "final_risk_oriented_score", "statistical_status", "recommendation_reason"],
+    )
+    write_csv(
+        args.out_dir / "ablation_paper_table.csv",
+        ablation_rows,
+        ["experiment_name", "cum_deficit_mae", "q95_cum_deficit_error", "q99_cum_deficit_error", "netload_ramp_max_mae", "imbalance_duration_mae", "corr_matrix_error", "extreme_degree_match_rate", "final_risk_oriented_score", "statistical_status", "recommendation_reason"],
+    )
 
-    dataset_context = load_dataset_context(args.dataset_summary)
-    markdown = build_markdown(dataset_context, compare_rows, key_rows)
-    (out_dir / "result_summary.md").write_text(markdown, encoding="utf-8")
+    markdown = build_markdown(load_dataset_context(args.dataset_summary), main_rows, ablation_rows)
+    (args.out_dir / "result_summary.md").write_text(markdown, encoding="utf-8")
 
 
 if __name__ == "__main__":

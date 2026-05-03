@@ -16,6 +16,23 @@ from train_hierarchical_evt_diffusion import TrainConfig, train_model
 
 BASE_DIR = Path(__file__).resolve().parent
 
+MAIN_COMPARE_METHODS = [
+    "traditional_gaussian_copula",
+    "plain_diffusion_baseline",
+    "improved_diffusion",
+    "enhanced_gan",
+    "proposed",
+]
+
+ABLATION_METHODS = [
+    "proposed",
+    "no_evt_strict",
+    "no_evt",
+    "no_risk_loss",
+    "no_month",
+    "flat_condition",
+]
+
 
 @dataclass
 class ExperimentConfig:
@@ -45,6 +62,7 @@ class ExperimentConfig:
     ema_decay: float = 0.995
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
+    checkpoint_type: str = "best-risk"
     seed: int = 42
 
 
@@ -148,8 +166,8 @@ def _train_and_generate(data_dir: Path, model_dir: Path, method_name: str, cfg: 
         s1, s2, s3 = cfg.stage1_epochs, cfg.stage2_epochs, cfg.stage3_epochs
         lambda_tail = cfg.lambda_tail
         lambda_risk = cfg.lambda_risk
-    elif method_name in {"no_evt", "no_risk_loss", "no_month", "flat_condition"}:
-        ablation = method_name
+    elif method_name in {"no_evt", "no_evt_continuous", "no_evt_strict", "no_risk_loss", "no_month", "flat_condition"}:
+        ablation = "no_evt" if method_name == "no_evt_continuous" else method_name
         s1, s2, s3 = cfg.stage1_epochs, cfg.stage2_epochs, cfg.stage3_epochs
         lambda_tail = cfg.lambda_tail
         lambda_risk = 0.0 if method_name == "no_risk_loss" else cfg.lambda_risk
@@ -194,14 +212,17 @@ def _train_and_generate(data_dir: Path, model_dir: Path, method_name: str, cfg: 
         seed=cfg.seed,
     )
     train_model(train_cfg)
-    guidance_scale = cfg.guidance_scale if method_name in {"proposed", "no_evt", "no_risk_loss", "no_month", "flat_condition"} else None
+    risk_trained_method = method_name in {"proposed", "no_evt", "no_evt_continuous", "no_evt_strict", "no_month", "flat_condition"}
+    checkpoint_type = cfg.checkpoint_type if risk_trained_method else "best"
+    guidance_scale = cfg.guidance_scale if method_name in {"proposed", "no_evt", "no_evt_continuous", "no_evt_strict", "no_risk_loss", "no_month", "flat_condition"} else None
     generate_from_checkpoint(
         GenerationConfig(
-            checkpoint=str(model_dir / "best_model.pt"),
+            checkpoint=None,
             data_dir=str(data_dir),
             out_dir=str(model_dir),
             split="test",
             guidance_scale=guidance_scale,
+            checkpoint_type=checkpoint_type,
         )
     )
     return model_dir / "generated_samples.npy"
@@ -257,19 +278,11 @@ def parse_args() -> ExperimentConfig:
     parser = argparse.ArgumentParser(description="Run unified scenario-generation experiments.")
     parser.add_argument("--data-dir", type=str, required=True)
     parser.add_argument("--out-dir", type=str, required=True)
+    parser.add_argument("--preset", type=str, default="custom", choices=["custom", "main", "ablation", "all"])
     parser.add_argument(
         "--methods",
         nargs="+",
-        default=[
-            "traditional_gaussian_copula",
-            "plain_diffusion_baseline",
-            "enhanced_gan",
-            "proposed",
-            "no_evt",
-            "no_risk_loss",
-            "no_month",
-            "flat_condition",
-        ],
+        default=None,
     )
     parser.add_argument("--seq-len", type=int, default=24)
     parser.add_argument("--stage1-epochs", type=int, default=12)
@@ -294,12 +307,23 @@ def parse_args() -> ExperimentConfig:
     parser.add_argument("--ema-decay", type=float, default=0.995)
     parser.add_argument("--learning-rate", "--lr", dest="learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--checkpoint-type", type=str, default="best-risk", choices=["best", "best-risk", "final"])
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if args.methods is not None:
+        methods = list(args.methods)
+    elif args.preset == "main":
+        methods = MAIN_COMPARE_METHODS
+    elif args.preset == "ablation":
+        methods = ABLATION_METHODS
+    elif args.preset == "all":
+        methods = [*MAIN_COMPARE_METHODS, *[m for m in ABLATION_METHODS if m not in MAIN_COMPARE_METHODS]]
+    else:
+        methods = [*MAIN_COMPARE_METHODS, *[m for m in ABLATION_METHODS if m not in MAIN_COMPARE_METHODS]]
     return ExperimentConfig(
         data_dir=args.data_dir,
         out_dir=args.out_dir,
-        methods=list(args.methods),
+        methods=methods,
         seq_len=args.seq_len,
         stage1_epochs=args.stage1_epochs,
         stage2_epochs=args.stage2_epochs,
@@ -323,6 +347,7 @@ def parse_args() -> ExperimentConfig:
         ema_decay=args.ema_decay,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        checkpoint_type=args.checkpoint_type,
         seed=args.seed,
     )
 

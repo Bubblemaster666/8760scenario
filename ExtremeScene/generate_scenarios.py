@@ -23,7 +23,7 @@ from hierarchical_diffusion import (
 
 @dataclass
 class GenerationConfig:
-    checkpoint: str
+    checkpoint: Optional[str]
     data_dir: str
     out_dir: str
     split: str = "test"
@@ -32,6 +32,29 @@ class GenerationConfig:
     month: Optional[int] = None
     severity_level: Optional[int] = None
     guidance_scale: Optional[float] = None
+    checkpoint_type: str = "best"
+
+
+def _checkpoint_name(checkpoint_type: str) -> str:
+    mapping = {
+        "best": "best_model.pt",
+        "best-risk": "best_risk_model.pt",
+        "final": "final_model.pt",
+    }
+    if checkpoint_type not in mapping:
+        raise ValueError(f"Unsupported checkpoint_type: {checkpoint_type}")
+    return mapping[checkpoint_type]
+
+
+def _resolve_checkpoint(cfg: GenerationConfig, out_dir: Path) -> tuple[Path, str]:
+    if cfg.checkpoint:
+        return Path(cfg.checkpoint), cfg.checkpoint_type
+    ckpt_path = out_dir / _checkpoint_name(cfg.checkpoint_type)
+    if not ckpt_path.exists() and cfg.checkpoint_type == "best-risk":
+        fallback = out_dir / "best_model.pt"
+        if fallback.exists():
+            return fallback, "best-risk-fallback-best"
+    return ckpt_path, cfg.checkpoint_type
 
 
 def _load_condition_frame(data_dir: Path, split: str) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -54,10 +77,13 @@ def _filter_conditions(cond_df: pd.DataFrame, cfg: GenerationConfig) -> pd.DataF
 
 
 def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
-    ckpt = torch.load(cfg.checkpoint, map_location="cpu", weights_only=False)
-    data_dir = Path(cfg.data_dir)
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path, resolved_checkpoint_type = _resolve_checkpoint(cfg, out_dir)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    data_dir = Path(cfg.data_dir)
 
     cond_df_full, meta_df_full = _load_condition_frame(data_dir, cfg.split)
     selected_cond = _filter_conditions(cond_df_full, cfg)
@@ -146,15 +172,30 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
         "split": cfg.split,
         "guidance_scale": guidance,
         "ablation_name": ckpt["train_config"]["ablation"],
+        "checkpoint_type": cfg.checkpoint_type,
+        "resolved_checkpoint_type": resolved_checkpoint_type,
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_epoch": ckpt.get("checkpoint_epoch"),
+        "checkpoint_stage": ckpt.get("checkpoint_stage"),
         "condition_meta": condition_meta,
     }
     (out_dir / "generation_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    model_summary_path = out_dir / "summary.json"
+    if model_summary_path.exists():
+        model_summary = json.loads(model_summary_path.read_text(encoding="utf-8"))
+        model_summary["checkpoint_type_used_for_generation"] = resolved_checkpoint_type
+        model_summary["checkpoint_path_used_for_generation"] = str(checkpoint_path)
+        model_summary["checkpoint_epoch_used_for_generation"] = ckpt.get("checkpoint_epoch")
+        model_summary["checkpoint_stage_used_for_generation"] = ckpt.get("checkpoint_stage")
+        model_summary_path.write_text(json.dumps(model_summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
 
 
 def parse_args() -> GenerationConfig:
     parser = argparse.ArgumentParser(description="Generate scenarios from a trained hierarchical diffusion checkpoint.")
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--checkpoint-type", type=str, default="best", choices=["best", "best-risk", "final"])
     parser.add_argument("--data-dir", type=str, required=True)
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--split", type=str, default="test")
@@ -174,6 +215,7 @@ def parse_args() -> GenerationConfig:
         month=args.month,
         severity_level=args.severity_level,
         guidance_scale=args.guidance_scale,
+        checkpoint_type=args.checkpoint_type,
     )
 
 
