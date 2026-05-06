@@ -20,15 +20,24 @@ def _night_solar_zero(seq: np.ndarray, window_start_time: str | pd.Timestamp) ->
     return out
 
 
-def _amplitude_augment(x: np.ndarray, meta: pd.DataFrame, rng: np.random.Generator) -> np.ndarray:
+def _amplitude_augment_one(x: np.ndarray, meta_row: pd.Series, rng: np.random.Generator) -> np.ndarray:
     out = x.copy()
-    out[:, 0, :] *= rng.uniform(0.97, 1.03, size=(len(out), 1))
-    out[:, 1, :] *= rng.uniform(0.90, 1.10, size=(len(out), 1))
-    out[:, 2, :] *= rng.uniform(0.90, 1.10, size=(len(out), 1))
+    out[0, :] *= rng.uniform(0.97, 1.03)
+    out[1, :] *= rng.uniform(0.90, 1.10)
+    out[2, :] *= rng.uniform(0.90, 1.10)
     out = np.clip(out, 0.0, None)
-    for i in range(len(out)):
-        out[i] = _night_solar_zero(out[i], meta.loc[i, "window_start_time"])
+    out = _night_solar_zero(out, meta_row.get("window_start_time", "2024-01-01 00:00:00"))
     return out.astype(np.float32)
+
+
+def _repeat_for_severity(level: int, args: argparse.Namespace) -> int:
+    if level <= 0:
+        return int(args.repeat_sev0)
+    if level == 1:
+        return int(args.repeat_sev1)
+    if level == 2:
+        return int(args.repeat_sev2)
+    return int(args.repeat_sev3)
 
 
 def _apply_risk_labels(x_aug: np.ndarray, cond_aug: pd.DataFrame, dataset_summary: dict) -> pd.DataFrame:
@@ -69,28 +78,46 @@ def augment_trainset(args: argparse.Namespace) -> dict:
     x_train = np.load(data_dir / "X_train.npy").astype(np.float32)
     cond_train = pd.read_csv(data_dir / "cond_train.csv")
     meta_train = pd.read_csv(data_dir / "meta_train.csv")
+    mask_path = data_dir / "event_mask_train.npy"
+    event_mask_train = np.load(mask_path).astype(np.float32) if mask_path.exists() else None
     summary_path = data_dir / "dataset_summary.json"
     dataset_summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
 
     rng = np.random.default_rng(args.seed)
     x_parts = [x_train]
-    cond_parts = [cond_train.copy()]
-    meta_parts = [meta_train.copy()]
-    methods = ["original"]
+    cond_parts = [cond_train.assign(augmentation_type="original")]
+    meta_parts = [meta_train.assign(augmentation_type="original")]
+    mask_parts = [event_mask_train] if event_mask_train is not None else []
 
-    for rep in range(args.amplitude_repeats):
-        x_aug = _amplitude_augment(x_train, meta_train, rng)
-        cond_aug = cond_train.copy()
-        meta_aug = meta_train.copy()
-        cond_aug["sample_id"] = cond_aug["sample_id"].astype(str) + f"_amp{rep + 1}"
-        meta_aug["sample_id"] = meta_aug["sample_id"].astype(str) + f"_amp{rep + 1}"
-        cond_aug["augmentation_type"] = "amplitude"
-        meta_aug["augmentation_type"] = "amplitude"
-        cond_aug = _apply_risk_labels(x_aug, cond_aug, dataset_summary)
-        x_parts.append(x_aug)
-        cond_parts.append(cond_aug)
-        meta_parts.append(meta_aug)
-        methods.append("amplitude")
+    new_x, new_cond_rows, new_meta_rows, new_masks = [], [], [], []
+    for i in range(len(x_train)):
+        level = int(cond_train.loc[i, "severity_level"]) if "severity_level" in cond_train.columns else 0
+        repeats = _repeat_for_severity(level, args)
+        for rep in range(repeats):
+            x_aug = _amplitude_augment_one(x_train[i], meta_train.loc[i], rng)
+            cond_row = cond_train.iloc[i].copy()
+            meta_row = meta_train.iloc[i].copy()
+            suffix = f"_aug{rep + 1}"
+            cond_row["sample_id"] = str(cond_row["sample_id"]) + suffix
+            meta_row["sample_id"] = str(meta_row["sample_id"]) + suffix
+            cond_row["augmentation_type"] = "severity_weighted_amplitude"
+            meta_row["augmentation_type"] = "severity_weighted_amplitude"
+            new_x.append(x_aug)
+            new_cond_rows.append(cond_row)
+            new_meta_rows.append(meta_row)
+            if event_mask_train is not None:
+                new_masks.append(event_mask_train[i].copy())
+
+    if new_x:
+        x_new = np.stack(new_x, axis=0).astype(np.float32)
+        cond_new = pd.DataFrame(new_cond_rows).reset_index(drop=True)
+        meta_new = pd.DataFrame(new_meta_rows).reset_index(drop=True)
+        cond_new = _apply_risk_labels(x_new, cond_new, dataset_summary)
+        x_parts.append(x_new)
+        cond_parts.append(cond_new)
+        meta_parts.append(meta_new)
+        if event_mask_train is not None:
+            mask_parts.append(np.stack(new_masks, axis=0).astype(np.float32))
 
     x_all = np.concatenate(x_parts, axis=0).astype(np.float32)
     cond_all = pd.concat(cond_parts, ignore_index=True)
@@ -99,12 +126,18 @@ def augment_trainset(args: argparse.Namespace) -> dict:
     np.save(out_dir / "X_train_aug.npy", x_all)
     cond_all.to_csv(out_dir / "cond_train_aug.csv", index=False, encoding="utf-8-sig")
     meta_all.to_csv(out_dir / "meta_train_aug.csv", index=False, encoding="utf-8-sig")
+    if event_mask_train is not None:
+        mask_all = np.concatenate(mask_parts, axis=0).astype(np.float32)
+        np.save(out_dir / "event_mask_train_aug.npy", mask_all)
+
     summary = {
         "enabled_by_default": False,
         "original_count": int(len(x_train)),
         "augmented_count": int(len(x_all)),
-        "amplitude_repeats": int(args.amplitude_repeats),
-        "methods": methods,
+        "new_augmented_only_count": int(len(x_all) - len(x_train)),
+        "repeat_by_severity": {"0": args.repeat_sev0, "1": args.repeat_sev1, "2": args.repeat_sev2, "3": args.repeat_sev3},
+        "methods": ["severity_weighted_amplitude"],
+        "event_mask_augmented": bool(event_mask_train is not None),
         "note": "Only the training split is augmented. Validation and test splits are untouched.",
     }
     (out_dir / "augmentation_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -115,7 +148,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Optional train-only augmentation for extreme samples.")
     parser.add_argument("--data-dir", type=str, required=True)
     parser.add_argument("--out-dir", type=str, default=None)
-    parser.add_argument("--amplitude-repeats", type=int, default=1)
+    parser.add_argument("--repeat-sev0", type=int, default=0)
+    parser.add_argument("--repeat-sev1", type=int, default=1)
+    parser.add_argument("--repeat-sev2", type=int, default=3)
+    parser.add_argument("--repeat-sev3", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 

@@ -84,6 +84,10 @@ through `low_wind_flag` and `low_irradiance_flag`.
   - shared net-load, cumulative deficit, ramp, and imbalance-duration logic
 - `train_hierarchical_evt_diffusion.py`
   - proposed method with hierarchical background/process/risk conditions
+- `build_pretrain_windows.py`
+  - normal-window Stage 0 pretraining window builder
+- `augment_risk_shapelet_trainset.py`
+  - train-only risk-shapelet-preserving extreme sample augmentation
 - `generate_scenarios.py`
   - unified conditional generation output
 - `evaluate_generation.py`
@@ -92,6 +96,8 @@ through `low_wind_flag` and `low_irradiance_flag`.
   - lightweight annual embedding loop
 - `run_experiments.py`
   - unified model/ablation runner
+- `run_pretrain_aug_experiments.py`
+  - proposed E0 vs normal pretraining / risk-shapelet augmentation runner
 - `run_paper_pipeline.py`
   - end-to-end paper demo
 
@@ -144,6 +150,7 @@ custom `ColumnMapping` into your own launcher.
 ## Extreme Sample Library Construction
 
 本文首先基于气象阈值识别重大天气事件候选窗口，但并非所有气象极端窗口都会导致电力系统运行风险。因此，本文进一步引入基于净负荷的联合失衡风险筛选，以累计缺额、最大净负荷爬坡和持续失衡时长作为风险刻画指标，筛选得到风光荷联合失衡极端样本。对于样本规模有限导致 EVT 离散等级不均衡的问题，采用 POT-GPD 连续尾部概率与经验分位严重等级相结合的标注方式，以保证风险条件具有足够训练样本。
+考虑到新疆干旱区降水过程具有短历时、局地性强的特点，本文不采用固定全国暴雨阈值，而是结合小时降水强度分位数和短时累计降水分位数识别强降水事件。为避免普通降水过程稀释极端样本库，进一步要求强降水事件对风光荷联合时序具有一定影响，例如出现低辐照、累计缺额、持续失衡或较大净负荷爬坡。
 
 Recommended preprocessing defaults:
 
@@ -201,6 +208,48 @@ The trainer supports three stages:
 - Stage 1: distribution learning
 - Stage 2: tail reinforcement
 - Stage 3: risk consistency learning
+
+Optional Stage 0 normal-window pretraining can be enabled before the three
+extreme-sample stages. Considering the limited number of major-weather-event
+samples, the model can first use normal windows from the full historical
+wind-solar-load series to learn source-load distributions, diurnal variation,
+and correlation structure; it is then fine-tuned on the fixed extreme sample
+library with tail reinforcement and risk consistency.
+
+Risk-shapelet-preserving augmentation is available as a train-only option. It
+borrows the shapelet-preserving bootstrapping idea: the `event_mask` core
+impact segment is treated as the key risk shapelet and is kept intact or only
+slightly jittered, while non-core buffer segments/residual fluctuations may be
+resampled within the same event type and similar severity. Augmented candidates
+are accepted only if cumulative deficit, maximum net-load ramp, and imbalance
+duration remain close to the source sample, so validation/test data and the
+fixed sample library remain untouched.
+
+中文说明：考虑到重大天气事件样本数量有限，本文首先利用全量历史风光荷时序中的常规窗口进行扩散模型预训练，使模型学习源荷基本分布、日内波动和相关性结构；随后在极端样本上进行尾部强化和风险一致性微调。借鉴 shapelet-preserving bootstrapping 思想，本文将 event_mask 标识的核心极端影响段视为风险关键形态片段，在训练集增强过程中保持核心段结构不被破坏，仅对非核心缓冲段或残差波动进行重采样和小幅扰动，并通过累计缺额、最大净负荷爬坡和持续失衡时长约束筛除风险语义偏离过大的增强样本。
+
+Risk EVT-transfer augmentation is provided as a separate plug-in experiment in
+`risk_evt_transfer_augmentation.py`. It follows the extreme-distribution
+transfer idea: a lightweight conditional WGAN-GP is trained on the current
+train split, candidate samples are generated under sampled event/month/risk
+conditions, real and generated samples are filtered by relative tail risk
+quantiles, and a fixed-size mixed train split is resampled from the retained
+tail pool while preserving a configurable fraction of original samples. The
+module then recomputes `cum_deficit`, `netload_ramp_max`,
+`imbalance_duration`, `extreme_prob`, `tail_score`, and `severity_level` using
+train data only. Validation and test files are never modified.
+
+```powershell
+python run_evt_transfer_experiment.py --exp C0_proposed_E0
+python run_evt_transfer_experiment.py --exp C1_evttransfer_cum
+python run_evt_transfer_experiment.py --exp C2_evttransfer_composite
+python run_evt_transfer_experiment.py --exp C3_evttransfer_strict
+python run_evt_transfer_experiment.py --exp C4_evttransfer_more
+```
+
+Experiment presets are documented in `configs/evt_transfer_experiments.yaml`.
+Outputs are written to `outputs/evt_transfer_experiments/<experiment>/`, and
+the cross-experiment comparison table is
+`outputs/evt_transfer_experiments/evt_transfer_summary.csv`.
 
 Recommended paper-level `proposed_final` configuration:
 

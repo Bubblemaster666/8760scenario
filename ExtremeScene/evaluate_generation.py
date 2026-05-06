@@ -10,9 +10,8 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.distance import jensenshannon
 from scipy.stats import wasserstein_distance
-from scipy.stats import genpareto
 
-from evt_fit import prob_to_level
+from evt_fit import EVTConfig, fit_evt_and_label
 from risk_metrics import batch_hard_risk_metrics
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans"]
@@ -28,16 +27,55 @@ class EvalConfig:
     out_dir: str
     model_name: str
     max_lag: int = 12
-    severity_info: str | None = None
+    event_mask: str | None = None
 
 
-def _load_inputs(cfg: EvalConfig) -> tuple[np.ndarray, np.ndarray, pd.DataFrame, pd.DataFrame]:
+EXTREME_MAIN_METRICS = [
+    "highrisk_wasserstein",
+    "highrisk_acf_mae",
+    "extreme_degree_match_rate",
+    "q99_cum_deficit_error",
+    "core_q99_cum_deficit_error",
+    "netload_ramp_max_mae",
+    "imbalance_duration_mae",
+]
+
+AUXILIARY_GLOBAL_STAT_METRICS = [
+    "mean_wasserstein",
+    "mean_js",
+    "acf_mae",
+    "corr_matrix_error",
+]
+
+HIGHRISK_METRIC_MAP = {
+    "mean_wasserstein": "highrisk_wasserstein",
+    "mean_js": "highrisk_js",
+    "acf_mae": "highrisk_acf_mae",
+    "corr_matrix_error": "highrisk_corr_matrix_error",
+    "cum_deficit_mae": "highrisk_cum_deficit_mae",
+    "q99_cum_deficit_error": "highrisk_q99_cum_deficit_error",
+    "netload_ramp_max_mae": "highrisk_netload_ramp_max_mae",
+    "imbalance_duration_mae": "highrisk_imbalance_duration_mae",
+}
+
+
+def _load_inputs(cfg: EvalConfig) -> tuple[np.ndarray, np.ndarray, pd.DataFrame, pd.DataFrame, np.ndarray | None]:
     real = np.load(cfg.real).astype(np.float32)
     gen = np.load(cfg.generated).astype(np.float32)
     cond = pd.read_csv(cfg.cond)
     meta = pd.read_csv(cfg.meta)
     n = min(len(real), len(gen), len(cond), len(meta))
-    return real[:n], gen[:n], cond.iloc[:n].reset_index(drop=True), meta.iloc[:n].reset_index(drop=True)
+    event_mask = None
+    mask_path = None
+    if cfg.event_mask:
+        mask_path = Path(cfg.event_mask)
+    else:
+        candidate = Path(cfg.cond).parent / "event_mask_test.npy"
+        if candidate.exists():
+            mask_path = candidate
+    if mask_path is not None and mask_path.exists():
+        event_mask = np.load(mask_path).astype(np.float32)[:n]
+    return real[:n], gen[:n], cond.iloc[:n].reset_index(drop=True), meta.iloc[:n].reset_index(drop=True), event_mask
 
 
 def _js_divergence(a: np.ndarray, b: np.ndarray, bins: int = 64) -> float:
@@ -83,93 +121,41 @@ def _mean_corr_matrix(samples: np.ndarray) -> np.ndarray:
     return np.mean(mats, axis=0)
 
 
-def _load_severity_info(cfg: EvalConfig) -> dict:
-    if cfg.severity_info:
-        path = Path(cfg.severity_info)
-    else:
-        path = Path(cfg.cond).parent / "dataset_summary.json"
-    if not path.exists():
-        return {"method": "condition_severity_thresholds_fallback", "source": "cond.csv"}
-    try:
-        summary = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {"method": "condition_severity_thresholds_fallback", "source": str(path)}
-    evt_info = summary.get("evt_info", {})
-    return {"method": "dataset_evt_info", "source": str(path), "evt_info": evt_info}
-
-
-def _levels_from_evt_info(generated_cum: np.ndarray, severity_info: dict) -> tuple[np.ndarray | None, str]:
-    evt_info = severity_info.get("evt_info", {})
-    severity_mode = str(evt_info.get("severity_mode", "")).lower()
-    severity_quantiles = evt_info.get("severity_quantiles", {})
-    if severity_mode in {"quantile", "hybrid"} and all(k in severity_quantiles for k in ["q1", "q2", "q3"]):
-        q1 = float(severity_quantiles["q1"])
-        q2 = float(severity_quantiles["q2"])
-        q3 = float(severity_quantiles["q3"])
-        if np.isfinite(q1) and np.isfinite(q2) and np.isfinite(q3):
-            values = np.asarray(generated_cum, dtype=float)
-            levels = np.zeros((len(values),), dtype=int)
-            levels = np.where(values >= q1, 1, levels)
-            levels = np.where(values >= q2, 2, levels)
-            levels = np.where(values >= q3, 3, levels)
-            if bool(severity_quantiles.get("positive_only", False)):
-                levels = np.where(values <= 0, 0, levels)
-            return levels.astype(int), f"dataset_evt_info_{severity_mode}_quantiles"
-
-    thresholds = evt_info.get("severity_thresholds", {})
-    required = {"threshold_u", "shape_c", "scale", "tail_prob_at_u"}
-    if evt_info.get("method") != "pot_gpd" or not required.issubset(evt_info):
-        return None, "condition_severity_thresholds_fallback"
-
-    threshold_u = float(evt_info["threshold_u"])
-    shape_c = float(evt_info["shape_c"])
-    scale = float(evt_info["scale"])
-    tail_prob_at_u = float(evt_info["tail_prob_at_u"])
-    severe_prob = float(thresholds.get("severe_prob", 0.01))
-    moderate_prob = float(thresholds.get("moderate_prob", 0.05))
-    mild_prob = float(thresholds.get("mild_prob", 0.10))
-
-    levels = []
-    for value in generated_cum:
-        if not np.isfinite(value):
-            levels.append(0)
-            continue
-        if value <= threshold_u:
-            prob = 1.0
-        else:
-            exceedance = float(value - threshold_u)
-            tail_cond = 1.0 - genpareto.cdf(exceedance, c=shape_c, loc=0.0, scale=scale)
-            prob = float(np.clip(tail_prob_at_u * tail_cond, 1e-8, 1.0))
-        levels.append(prob_to_level(prob, severe_prob, moderate_prob, mild_prob))
-    return np.asarray(levels, dtype=int), "dataset_evt_info_pot_gpd"
-
-
-def _levels_from_condition_thresholds(cond: pd.DataFrame, generated_cum: np.ndarray) -> np.ndarray:
-    target_level = cond["severity_level"].fillna(0).astype(int).to_numpy()
-    target_cum = cond["cum_deficit"].fillna(0).astype(float).to_numpy()
-    thresholds: dict[int, float] = {}
-    for level in [1, 2, 3]:
-        mask = target_level >= level
-        if np.any(mask):
-            thresholds[level] = float(np.min(target_cum[mask]))
-
-    levels = np.zeros((len(generated_cum),), dtype=int)
-    for level, threshold in thresholds.items():
-        levels = np.where(generated_cum >= threshold, level, levels)
-    return levels
-
-
-def _severity_match_rate(cond: pd.DataFrame, generated_cum: np.ndarray, severity_info: dict) -> tuple[float, float, str]:
-    gen_level, method = _levels_from_evt_info(generated_cum, severity_info)
-    if gen_level is None:
-        gen_level = _levels_from_condition_thresholds(cond, generated_cum)
+def _severity_match_rate(cond: pd.DataFrame, generated_cum: np.ndarray) -> tuple[float, float]:
+    gen_df = pd.DataFrame({"cum_deficit": generated_cum})
+    labeled, _ = fit_evt_and_label(gen_df, EVTConfig(metric_col="cum_deficit"))
+    gen_level = labeled["severity_level"].fillna(0).astype(int).to_numpy()
     target = cond["severity_level"].fillna(0).astype(int).to_numpy()
     exact = float(np.mean(gen_level == target))
     adjacent = float(np.mean(np.abs(gen_level - target) <= 1))
-    return exact, adjacent, method
+    return exact, adjacent
 
 
-def compute_metrics(real: np.ndarray, gen: np.ndarray, cond: pd.DataFrame, max_lag: int, severity_info: dict | None = None) -> dict[str, float | str]:
+
+def _batch_core_risk_metrics(x: np.ndarray, event_mask: np.ndarray, tau: np.ndarray | float, delta_t_hours: float = 1.0) -> dict[str, np.ndarray]:
+    tau_arr = np.asarray(tau, dtype=float)
+    if tau_arr.ndim == 0:
+        tau_arr = np.full((x.shape[0],), float(tau_arr), dtype=float)
+    cum, ramp_max, duration = [], [], []
+    for i in range(x.shape[0]):
+        mask = np.asarray(event_mask[i], dtype=float) > 0.5
+        if not np.any(mask):
+            mask = np.ones((x.shape[2],), dtype=bool)
+        net = x[i, 0, mask] - x[i, 1, mask] - x[i, 2, mask]
+        if net.size == 0:
+            cum.append(0.0); ramp_max.append(0.0); duration.append(0.0); continue
+        excess = np.maximum(0.0, net - tau_arr[i])
+        cum.append(float(excess.sum() * delta_t_hours))
+        ramp = np.diff(net, prepend=net[0])
+        ramp_max.append(float(np.max(ramp)))
+        duration.append(float((net > tau_arr[i]).sum() * delta_t_hours))
+    return {
+        "cum_deficit": np.asarray(cum, dtype=float),
+        "netload_ramp_max": np.asarray(ramp_max, dtype=float),
+        "imbalance_duration": np.asarray(duration, dtype=float),
+    }
+
+def compute_metrics(real: np.ndarray, gen: np.ndarray, cond: pd.DataFrame, max_lag: int, event_mask: np.ndarray | None = None) -> dict[str, float | str]:
     names = ["load", "wind_power", "solar_power"]
     metrics: dict[str, float] = {}
     wasserstein_scores = []
@@ -216,22 +202,54 @@ def compute_metrics(real: np.ndarray, gen: np.ndarray, cond: pd.DataFrame, max_l
         metrics[f"q99_{key}_error"] = q99_err
         risk_rows.append((key, real_arr, gen_arr))
 
-    exact_match, adjacent_match, severity_method = _severity_match_rate(
-        cond,
-        np.asarray(risk_gen["cum_deficit"], dtype=float),
-        severity_info or {"method": "condition_severity_thresholds_fallback"},
-    )
+    if event_mask is not None:
+        core_real = _batch_core_risk_metrics(real, event_mask, tau=tau, delta_t_hours=delta_t)
+        core_gen = _batch_core_risk_metrics(gen, event_mask, tau=tau, delta_t_hours=delta_t)
+        for key in ["cum_deficit", "netload_ramp_max", "imbalance_duration"]:
+            real_arr = np.asarray(core_real[key], dtype=float)
+            gen_arr = np.asarray(core_gen[key], dtype=float)
+            metrics[f"core_{key}_mae"] = float(np.mean(np.abs(real_arr - gen_arr)))
+            metrics[f"core_q95_{key}_error"] = float(abs(np.quantile(gen_arr, 0.95) - np.quantile(real_arr, 0.95)))
+            metrics[f"core_q99_{key}_error"] = float(abs(np.quantile(gen_arr, 0.99) - np.quantile(real_arr, 0.99)))
+
+    exact_match, adjacent_match = _severity_match_rate(cond, np.asarray(risk_gen["cum_deficit"], dtype=float))
     metrics["extreme_degree_match_rate"] = exact_match
     metrics["extreme_degree_adjacent_match_rate"] = adjacent_match
-    metrics["severity_classification_method"] = severity_method
     return metrics
 
 
-def _group_metrics(real: np.ndarray, gen: np.ndarray, cond: pd.DataFrame, group_col: str, max_lag: int, severity_info: dict) -> pd.DataFrame:
+def compute_highrisk_metrics(
+    real: np.ndarray,
+    gen: np.ndarray,
+    cond: pd.DataFrame,
+    max_lag: int,
+    event_mask: np.ndarray | None = None,
+) -> tuple[dict[str, float], str | None]:
+    """Compute high-risk conditional metrics on samples with severity_level >= 2."""
+    out = {target: float("nan") for target in HIGHRISK_METRIC_MAP.values()}
+    if "severity_level" not in cond.columns:
+        return out, "severity_level is missing; highrisk metrics are NaN."
+    severity = pd.to_numeric(cond["severity_level"], errors="coerce").fillna(0).astype(int)
+    idx = np.where(severity.to_numpy() >= 2)[0]
+    if idx.size < 3:
+        return out, "highrisk sample count is less than 3; highrisk metrics are NaN."
+    sub_metrics = compute_metrics(
+        real[idx],
+        gen[idx],
+        cond.iloc[idx].reset_index(drop=True),
+        max_lag=max_lag,
+        event_mask=None if event_mask is None else event_mask[idx],
+    )
+    for source, target in HIGHRISK_METRIC_MAP.items():
+        out[target] = float(sub_metrics.get(source, np.nan))
+    return out, None
+
+
+def _group_metrics(real: np.ndarray, gen: np.ndarray, cond: pd.DataFrame, group_col: str, max_lag: int, event_mask: np.ndarray | None = None) -> pd.DataFrame:
     rows = []
     for value, sub_idx in cond.groupby(group_col).groups.items():
         idx = np.asarray(list(sub_idx), dtype=int)
-        sub_metrics = compute_metrics(real[idx], gen[idx], cond.iloc[idx].reset_index(drop=True), max_lag=max_lag, severity_info=severity_info)
+        sub_metrics = compute_metrics(real[idx], gen[idx], cond.iloc[idx].reset_index(drop=True), max_lag=max_lag, event_mask=None if event_mask is None else event_mask[idx])
         sub_metrics[group_col] = value
         rows.append(sub_metrics)
     return pd.DataFrame(rows)
@@ -338,15 +356,35 @@ def evaluate_generation(cfg: EvalConfig) -> dict:
     figures_dir = out_dir / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    real, gen, cond, meta = _load_inputs(cfg)
-    severity_info = _load_severity_info(cfg)
-    metrics = compute_metrics(real, gen, cond, cfg.max_lag, severity_info=severity_info)
+    real, gen, cond, meta, event_mask = _load_inputs(cfg)
+    warnings: list[str] = []
+    if event_mask is None:
+        warnings.append("event_mask_test.npy is missing; core metrics are unavailable.")
+    metrics = compute_metrics(real, gen, cond, cfg.max_lag, event_mask=event_mask)
+    if event_mask is None:
+        metrics["core_q99_cum_deficit_error"] = float("nan")
+    highrisk_metrics, highrisk_warning = compute_highrisk_metrics(real, gen, cond, cfg.max_lag, event_mask=event_mask)
+    metrics.update(highrisk_metrics)
+    if highrisk_warning:
+        warnings.append(highrisk_warning)
     metrics["model_name"] = cfg.model_name
 
     metrics_df = pd.DataFrame([metrics])
     metrics_df.to_csv(out_dir / "metrics_summary.csv", index=False, encoding="utf-8-sig")
-    _group_metrics(real, gen, cond, "event_type", cfg.max_lag, severity_info).to_csv(out_dir / "metrics_by_event_type.csv", index=False, encoding="utf-8-sig")
-    _group_metrics(real, gen, cond, "severity_level", cfg.max_lag, severity_info).to_csv(out_dir / "metrics_by_severity.csv", index=False, encoding="utf-8-sig")
+    extreme_columns = ["model_name", *EXTREME_MAIN_METRICS]
+    pd.DataFrame([{col: metrics.get(col, np.nan) for col in extreme_columns}]).to_csv(
+        out_dir / "extreme_metrics_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    auxiliary_columns = ["model_name", *AUXILIARY_GLOBAL_STAT_METRICS]
+    pd.DataFrame([{col: metrics.get(col, np.nan) for col in auxiliary_columns}]).to_csv(
+        out_dir / "auxiliary_global_stat_metrics.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    _group_metrics(real, gen, cond, "event_type", cfg.max_lag, event_mask=event_mask).to_csv(out_dir / "metrics_by_event_type.csv", index=False, encoding="utf-8-sig")
+    _group_metrics(real, gen, cond, "severity_level", cfg.max_lag, event_mask=event_mask).to_csv(out_dir / "metrics_by_severity.csv", index=False, encoding="utf-8-sig")
 
     risk_df = _plot_risk_boxplot(real, gen, cond, figures_dir)
     risk_df.to_csv(out_dir / "risk_metrics_real_vs_generated.csv", index=False, encoding="utf-8-sig")
@@ -357,11 +395,11 @@ def evaluate_generation(cfg: EvalConfig) -> dict:
     summary = {
         "model_name": cfg.model_name,
         "num_samples": int(len(cond)),
-        "severity_classification": {
-            "method": metrics.get("severity_classification_method"),
-            "source": severity_info.get("source"),
-            "note": "Generated samples are classified with fixed dataset EVT information when available; otherwise condition severity thresholds are used. The evaluator no longer re-fits EVT on generated samples.",
-        },
+        "risk_metric_scope": "both" if event_mask is not None else "full_window",
+        "event_mask_used": bool(event_mask is not None),
+        "warnings": warnings,
+        "paper_main_metrics": {metric: metrics.get(metric) for metric in EXTREME_MAIN_METRICS},
+        "auxiliary_global_stat_metrics": {metric: metrics.get(metric) for metric in AUXILIARY_GLOBAL_STAT_METRICS},
         "metrics": metrics,
     }
     (out_dir / "evaluation_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -377,7 +415,7 @@ def parse_args() -> EvalConfig:
     parser.add_argument("--model-name", type=str, required=True)
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--max-lag", type=int, default=12)
-    parser.add_argument("--severity-info", type=str, default=None)
+    parser.add_argument("--event-mask", type=str, default=None)
     args = parser.parse_args()
     return EvalConfig(
         real=args.real,
@@ -387,7 +425,7 @@ def parse_args() -> EvalConfig:
         out_dir=args.out_dir,
         model_name=args.model_name,
         max_lag=args.max_lag,
-        severity_info=args.severity_info,
+        event_mask=args.event_mask,
     )
 
 

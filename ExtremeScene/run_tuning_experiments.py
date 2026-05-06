@@ -46,7 +46,7 @@ class TuningConfig:
     data_dir: str
     out_dir: str
     variants: list[str]
-    seq_len: int = 24
+    seq_len: int = 36
     diffusion_steps: int = 100
     base_channels: int = 64
     batch_size: int = 32
@@ -79,7 +79,7 @@ def parse_args() -> TuningConfig:
     parser.add_argument("--data-dir", type=str, required=True)
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--variants", nargs="+", choices=sorted(PRESETS), default=list(PRESETS))
-    parser.add_argument("--seq-len", type=int, default=24)
+    parser.add_argument("--seq-len", type=int, default=36)
     parser.add_argument("--diffusion-steps", type=int, default=100)
     parser.add_argument("--base-channels", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=32)

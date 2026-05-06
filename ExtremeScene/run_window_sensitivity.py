@@ -74,6 +74,12 @@ def run_window_sensitivity(args: argparse.Namespace) -> pd.DataFrame:
         low_wind_quantile=args.low_wind_quantile,
         low_resource_min_hours=args.low_resource_min_hours,
         daylight_irradiance_min=args.daylight_irradiance_min,
+        heavy_rain_quantile=args.heavy_rain_quantile,
+        heavy_rain_rolling_quantile=args.heavy_rain_rolling_quantile,
+        rain_rolling_window_hours=args.rain_rolling_window_hours,
+        rain_min_event_hours=args.rain_min_event_hours,
+        rain_min_total_precip=args.rain_min_total_precip,
+        rain_require_power_impact=args.rain_require_power_impact,
         cold_temp_quantile=0.10,
         cold_drop_24h_quantile=0.95,
         heat_temp_quantile=0.98,
@@ -102,6 +108,7 @@ def run_window_sensitivity(args: argparse.Namespace) -> pd.DataFrame:
                 min_cum_deficit=args.min_cum_deficit,
                 min_imbalance_duration=args.min_imbalance_duration,
                 ramp_quantile=args.ramp_quantile,
+                rain_require_power_impact=args.rain_require_power_impact,
             ),
             output_dir=out_dir / f"seq_len_{seq_len}",
         )
@@ -151,10 +158,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-mock", action="store_true")
     parser.add_argument("--real-data-csv", type=str, action="append", default=None)
     parser.add_argument("--seq-len", type=int, nargs="+", default=[24, 36, 48])
-    parser.add_argument("--low-irr-quantile", type=float, default=0.30)
+    parser.add_argument("--low-irr-quantile", type=float, default=0.35)
     parser.add_argument("--low-wind-quantile", type=float, default=0.30)
     parser.add_argument("--low-resource-min-hours", type=int, default=3)
     parser.add_argument("--daylight-irradiance-min", type=float, default=30.0)
+    parser.add_argument("--heavy-rain-quantile", type=float, default=0.98)
+    parser.add_argument("--heavy-rain-rolling-quantile", type=float, default=0.97)
+    parser.add_argument("--rain-rolling-window-hours", type=int, default=3)
+    parser.add_argument("--rain-min-event-hours", type=int, default=2)
+    parser.add_argument("--rain-min-total-precip", type=float, default=None)
+    parser.add_argument("--rain-require-power-impact", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--risk-screen-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--risk-screen-mode", type=str, default="medium", choices=["loose", "medium", "strict", "hybrid"])
     parser.add_argument("--min-cum-deficit", type=float, default=0.0)

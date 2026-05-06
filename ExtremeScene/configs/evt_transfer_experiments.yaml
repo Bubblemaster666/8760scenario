@@ -1,0 +1,41 @@
+﻿# EVT distribution-transfer augmentation experiments.
+# These settings only affect train augmentation; val/test stay in the original dataset.
+C0_proposed_E0:
+  use_transfer: false
+  description: Original E0 proposed baseline, no EVT-transfer augmentation.
+
+C1_evttransfer_cum:
+  use_transfer: true
+  risk_mode: cum
+  epsilon: 0.70
+  num_transfer_iters: 3
+  candidate_multiplier: 3
+  keep_original_ratio: 0.30
+  resample_strategy: mixed
+
+C2_evttransfer_composite:
+  use_transfer: true
+  risk_mode: composite
+  epsilon: 0.70
+  num_transfer_iters: 3
+  candidate_multiplier: 3
+  keep_original_ratio: 0.30
+  resample_strategy: mixed
+
+C3_evttransfer_strict:
+  use_transfer: true
+  risk_mode: strict
+  epsilon: 0.75
+  num_transfer_iters: 3
+  candidate_multiplier: 5
+  keep_original_ratio: 0.20
+  resample_strategy: mixed
+
+C4_evttransfer_more:
+  use_transfer: true
+  risk_mode: composite
+  epsilon: 0.75
+  num_transfer_iters: 5
+  candidate_multiplier: 5
+  keep_original_ratio: 0.20
+  resample_strategy: mixed

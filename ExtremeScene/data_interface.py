@@ -16,14 +16,18 @@ from sample_metrics import MetricConfig, compute_metrics_for_samples
 
 DEFAULT_EVENT_TYPE_MAPPING = {
     "寒潮": 0,
-    "暴雪/风吹雪": 1,
+    "暴雨/强降水": 1,
     "大风/沙尘暴": 2,
     "高温": 3,
 }
 
 EVENT_TYPE_ALIASES = {
     "寒潮": "寒潮",
-    "暴雪/风吹雪": "暴雪/风吹雪",
+    "暴雪/风吹雪": "暴雨/强降水",
+    "暴雨": "暴雨/强降水",
+    "强降水": "暴雨/强降水",
+    "强降水/山洪": "暴雨/强降水",
+    "暴雨/强降水": "暴雨/强降水",
     "大风/沙尘暴": "大风/沙尘暴",
     "高温": "高温",
 }
@@ -40,11 +44,12 @@ class ColumnMapping:
     irradiance_col: str = "irradiance"
     snowfall_col: str = "snowfall"
     visibility_col: str = "visibility"
+    precipitation_col: str = "precipitation"
 
 
 @dataclass
 class DatasetBuildConfig:
-    seq_len: int = 24
+    seq_len: int = 36
     add_buffer_hours: int = 2
     merge_overlap: bool = False
     train_ratio: float = 0.7
@@ -76,18 +81,21 @@ def canonicalize_event_type(value: str) -> str:
     return EVENT_TYPE_ALIASES.get(text, text)
 
 
-def _extract_fixed_window(
-    df: pd.DataFrame,
-    time_col: str,
-    start_time: pd.Timestamp,
-    seq_len: int,
-    value_cols: list[str],
-) -> pd.DataFrame:
+def _extract_fixed_window(df: pd.DataFrame, time_col: str, start_time: pd.Timestamp, seq_len: int, value_cols: list[str]) -> pd.DataFrame:
     time_index = pd.date_range(start_time, periods=seq_len, freq="1h")
     sub = df.set_index(time_col)[value_cols].reindex(time_index)
     sub = sub.ffill().bfill().fillna(0.0)
     sub.index.name = time_col
     return sub.reset_index()
+
+
+def _build_event_mask(core_start: pd.Timestamp, core_end: pd.Timestamp, window_start: pd.Timestamp, seq_len: int) -> tuple[np.ndarray, int, int]:
+    timeline = pd.date_range(window_start, periods=seq_len, freq="1h")
+    mask = ((timeline >= core_start) & (timeline <= core_end)).astype(np.float32)
+    idx = np.where(mask > 0.5)[0]
+    if len(idx) == 0:
+        return mask.astype(np.float32), -1, -1
+    return mask.astype(np.float32), int(idx[0]), int(idx[-1])
 
 
 def _build_detect_config(mapping: ColumnMapping) -> DetectConfig:
@@ -98,6 +106,7 @@ def _build_detect_config(mapping: ColumnMapping) -> DetectConfig:
         irradiance_col=mapping.irradiance_col,
         snowfall_col=mapping.snowfall_col,
         visibility_col=mapping.visibility_col,
+        precipitation_col=mapping.precipitation_col,
     )
 
 
@@ -125,36 +134,27 @@ def build_event_samples(
     detect_cfg = detect_cfg or _build_detect_config(mapping)
     metric_cfg = metric_cfg or _build_metric_config(mapping)
     evt_cfg = evt_cfg or EVTConfig(metric_col="cum_deficit")
-    risk_screen_cfg = risk_screen_cfg or RiskScreenConfig()
+    risk_screen_cfg = risk_screen_cfg or RiskScreenConfig(rain_require_power_impact=bool(detect_cfg.rain_require_power_impact))
     intermediate_dir = Path(intermediate_output_dir) if intermediate_output_dir is not None else None
 
-    samples = detect_extreme_samples(
-        df=df,
-        cfg=detect_cfg,
-        add_buffer_hours=add_buffer_hours,
-        merge_overlap=merge_overlap,
-    )
+    samples = detect_extreme_samples(df=df, cfg=detect_cfg, add_buffer_hours=add_buffer_hours, merge_overlap=merge_overlap)
     samples = compute_metrics_for_samples(df=df, samples=samples, cfg=metric_cfg)
     if intermediate_dir is not None:
         intermediate_dir.mkdir(parents=True, exist_ok=True)
+        samples.to_csv(intermediate_dir / "samples_weather_candidates_with_metrics.csv", index=False, encoding="utf-8-sig")
         tau_diagnostic = samples.attrs.get("tau_diagnostic")
         if isinstance(tau_diagnostic, pd.DataFrame):
             tau_diagnostic.to_csv(intermediate_dir / "tau_diagnostic.csv", index=False, encoding="utf-8-sig")
-    screened, risk_screen_summary = screen_risk_samples(
-        samples=samples,
-        cfg=risk_screen_cfg,
-        output_dir=intermediate_dir,
-    )
+
+    screened, risk_screen_summary = screen_risk_samples(samples=samples, cfg=risk_screen_cfg, output_dir=intermediate_dir)
     labeled, evt_info = fit_evt_and_label(samples=screened, cfg=evt_cfg)
     risk_screen_summary["severity_counts_after"] = {
-        str(k): int(v)
-        for k, v in labeled.get("severity_level", pd.Series(dtype=int)).fillna(0).astype(int).value_counts().sort_index().items()
+        str(k): int(v) for k, v in labeled.get("severity_level", pd.Series(dtype=int)).fillna(0).astype(int).value_counts().sort_index().items()
     }
     if intermediate_dir is not None:
         labeled.to_csv(intermediate_dir / "samples_after_risk_screen_labeled.csv", index=False, encoding="utf-8-sig")
         (intermediate_dir / "risk_screen_summary.json").write_text(
-            json.dumps(risk_screen_summary, ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
+            json.dumps(risk_screen_summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
         )
     evt_info["risk_screening"] = risk_screen_summary
     return labeled, evt_info
@@ -179,7 +179,6 @@ def build_dataset_artifacts(
     df_local = df.copy()
     df_local[mapping.time_col] = pd.to_datetime(df_local[mapping.time_col])
     df_local = df_local.sort_values(mapping.time_col).reset_index(drop=True)
-
     if labeled_samples.empty:
         raise ValueError("No extreme-event samples were found for dataset export.")
 
@@ -189,27 +188,23 @@ def build_dataset_artifacts(
 
     channels = [mapping.load_col, mapping.wind_col, mapping.solar_col]
     x_list: list[np.ndarray] = []
+    mask_list: list[np.ndarray] = []
     cond_rows: list[dict[str, Any]] = []
     meta_rows: list[dict[str, Any]] = []
 
     for _, row in samples.iterrows():
         core_start = pd.to_datetime(row["core_start_time"])
         core_end = pd.to_datetime(row["core_end_time"])
-        center = core_start + (core_end - core_start) / 2
-        center = pd.Timestamp(center).round("1h")
+        center = pd.Timestamp(core_start + (core_end - core_start) / 2).round("1h")
         half_window = build_cfg.seq_len // 2
         window_start = center - pd.Timedelta(hours=half_window)
         window_end = window_start + pd.Timedelta(hours=build_cfg.seq_len - 1)
 
-        fixed_sub = _extract_fixed_window(
-            df_local,
-            time_col=mapping.time_col,
-            start_time=window_start,
-            seq_len=build_cfg.seq_len,
-            value_cols=channels,
-        )
+        fixed_sub = _extract_fixed_window(df_local, mapping.time_col, window_start, build_cfg.seq_len, channels)
         seq = fixed_sub[channels].to_numpy(dtype=np.float32).T
         x_list.append(seq)
+        event_mask, core_start_offset, core_end_offset = _build_event_mask(core_start, core_end, window_start, build_cfg.seq_len)
+        mask_list.append(event_mask)
 
         event_type = canonicalize_event_type(row["event_type"])
         month = int(pd.Timestamp(core_start).month)
@@ -229,6 +224,9 @@ def build_dataset_artifacts(
                 "low_wind_flag": int(row.get("low_wind_flag", 0)),
                 "low_irradiance_flag": int(row.get("low_irradiance_flag", 0)),
                 "duration_hours": float(row.get("duration_hours", 0.0)),
+                "core_n_steps": int(row.get("core_n_steps", max(0, core_end_offset - core_start_offset + 1))),
+                "core_start_offset": int(core_start_offset),
+                "core_end_offset": int(core_end_offset),
                 "extreme_prob": float(row.get("extreme_prob", np.nan)),
                 "tail_score": tail_score,
                 "tail_score_zscore": tail_score_z,
@@ -251,27 +249,29 @@ def build_dataset_artifacts(
                 "window_end_time": window_end,
                 "original_start_time": pd.to_datetime(row["start_time"]),
                 "original_end_time": pd.to_datetime(row["end_time"]),
+                "core_start_offset": int(core_start_offset),
+                "core_end_offset": int(core_end_offset),
             }
         )
 
     X = np.stack(x_list, axis=0).astype(np.float32)
+    event_mask = np.stack(mask_list, axis=0).astype(np.float32)
     cond_df = pd.DataFrame(cond_rows)
     meta_df = pd.DataFrame(meta_rows)
     split_df = make_dataset_split(cond_df, build_cfg=build_cfg)
 
     np.save(out_dir / "X.npy", X)
+    np.save(out_dir / "event_mask.npy", event_mask)
     cond_df.to_csv(out_dir / "cond.csv", index=False, encoding="utf-8-sig")
     meta_df.to_csv(out_dir / "meta.csv", index=False, encoding="utf-8-sig")
     split_df.to_csv(out_dir / "split_assignments.csv", index=False, encoding="utf-8-sig")
     with open(out_dir / "event_type_mapping.json", "w", encoding="utf-8") as f:
         json.dump(event_type_mapping, f, ensure_ascii=False, indent=2)
 
-    split_to_idx = {
-        split: split_df.index[split_df["split"] == split].to_numpy(dtype=int)
-        for split in ["train", "val", "test"]
-    }
+    split_to_idx = {split: split_df.index[split_df["split"] == split].to_numpy(dtype=int) for split in ["train", "val", "test"]}
     for split, idx in split_to_idx.items():
         np.save(out_dir / f"X_{split}.npy", X[idx])
+        np.save(out_dir / f"event_mask_{split}.npy", event_mask[idx])
         cond_df.iloc[idx].reset_index(drop=True).to_csv(out_dir / f"cond_{split}.csv", index=False, encoding="utf-8-sig")
         meta_df.iloc[idx].reset_index(drop=True).to_csv(out_dir / f"meta_{split}.csv", index=False, encoding="utf-8-sig")
 
@@ -281,6 +281,7 @@ def build_dataset_artifacts(
         "event_type_mapping": event_type_mapping,
         "evt_info": evt_info or {},
         "x_shape": list(X.shape),
+        "event_mask_shape": list(event_mask.shape),
         "n_samples": int(len(cond_df)),
         "split_counts": split_df["split"].value_counts().to_dict(),
         "event_type_counts": cond_df["event_type"].value_counts().to_dict(),
@@ -291,14 +292,7 @@ def build_dataset_artifacts(
     with open(out_dir / "dataset_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
 
-    return {
-        "X": X,
-        "cond_df": cond_df,
-        "meta_df": meta_df,
-        "split_df": split_df,
-        "summary": summary,
-        "output_dir": out_dir,
-    }
+    return {"X": X, "event_mask": event_mask, "cond_df": cond_df, "meta_df": meta_df, "split_df": split_df, "summary": summary, "output_dir": out_dir}
 
 
 def make_dataset_split(cond_df: pd.DataFrame, build_cfg: DatasetBuildConfig) -> pd.DataFrame:
@@ -306,12 +300,10 @@ def make_dataset_split(cond_df: pd.DataFrame, build_cfg: DatasetBuildConfig) -> 
         raise ValueError("cond_df is empty.")
     if not np.isclose(build_cfg.train_ratio + build_cfg.val_ratio + build_cfg.test_ratio, 1.0):
         raise ValueError("train_ratio + val_ratio + test_ratio must sum to 1.")
-
     group_col = build_cfg.split_group_col if build_cfg.split_group_col in cond_df.columns else "sample_id"
     groups = cond_df[group_col].astype(str).drop_duplicates().to_list()
     rng = np.random.default_rng(build_cfg.split_seed)
     groups = list(rng.permutation(groups))
-
     n_groups = len(groups)
     if n_groups == 1:
         train_groups, val_groups, test_groups = set(groups), set(), set()
@@ -325,7 +317,6 @@ def make_dataset_split(cond_df: pd.DataFrame, build_cfg: DatasetBuildConfig) -> 
         n_test = max(1, n_groups - n_train - n_val)
         if n_train + n_val + n_test > n_groups:
             n_train = max(1, n_groups - n_val - n_test)
-
         train_groups = set(groups[:n_train])
         val_groups = set(groups[n_train : n_train + n_val])
         test_groups = set(groups[n_train + n_val :])
@@ -333,7 +324,6 @@ def make_dataset_split(cond_df: pd.DataFrame, build_cfg: DatasetBuildConfig) -> 
             moved = next(iter(val_groups))
             val_groups.remove(moved)
             test_groups.add(moved)
-
     split_df = cond_df[["sample_id"]].copy()
     split_df[group_col] = cond_df[group_col].astype(str)
     split_df["split"] = "test" if test_groups else "train"

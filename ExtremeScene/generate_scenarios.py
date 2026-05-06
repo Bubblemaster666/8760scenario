@@ -12,13 +12,14 @@ import torch
 
 from hierarchical_diffusion import (
     ConditionNormalizers,
-    HierarchicalConditionalUNet1D,
     DiffusionScheduler,
+    HierarchicalConditionalUNet1D,
     apply_physical_projection,
     build_condition_bundle,
     denormalize_x_np,
     sample_sequences,
 )
+from risk_metrics import batch_hard_risk_metrics
 
 
 @dataclass
@@ -31,30 +32,39 @@ class GenerationConfig:
     event_type: Optional[str] = None
     month: Optional[int] = None
     severity_level: Optional[int] = None
+    duration_hours: Optional[float] = None
     guidance_scale: Optional[float] = None
     checkpoint_type: str = "best"
+    num_candidates_per_condition: int = 1
+    candidate_selection_mode: str = "none"
+    candidate_risk_weights: str = "cum:1.0,ramp:0.3,duration:0.3"
+    save_generated_candidates: bool = True
 
 
 def _checkpoint_name(checkpoint_type: str) -> str:
-    mapping = {
-        "best": "best_model.pt",
-        "best-risk": "best_risk_model.pt",
-        "final": "final_model.pt",
-    }
+    mapping = {"best": "best_model.pt", "best-risk": "best_risk_model.pt", "final": "final_model.pt"}
     if checkpoint_type not in mapping:
         raise ValueError(f"Unsupported checkpoint_type: {checkpoint_type}")
     return mapping[checkpoint_type]
 
 
-def _resolve_checkpoint(cfg: GenerationConfig, out_dir: Path) -> tuple[Path, str]:
+def _resolve_checkpoint(cfg: GenerationConfig, out_dir: Path) -> tuple[Path, str, list[str]]:
     if cfg.checkpoint:
-        return Path(cfg.checkpoint), cfg.checkpoint_type
+        return Path(cfg.checkpoint), cfg.checkpoint_type, []
     ckpt_path = out_dir / _checkpoint_name(cfg.checkpoint_type)
+    if ckpt_path.exists():
+        return ckpt_path, cfg.checkpoint_type, []
+    warnings: list[str] = []
     if not ckpt_path.exists() and cfg.checkpoint_type == "best-risk":
-        fallback = out_dir / "best_model.pt"
-        if fallback.exists():
-            return fallback, "best-risk-fallback-best"
-    return ckpt_path, cfg.checkpoint_type
+        best_fallback = out_dir / "best_model.pt"
+        if best_fallback.exists():
+            warnings.append("best_risk_model.pt was not found; fell back to best_model.pt.")
+            return best_fallback, "best-risk-fallback-best", warnings
+        final_fallback = out_dir / "final_model.pt"
+        if final_fallback.exists():
+            warnings.append("best_risk_model.pt and best_model.pt were not found; fell back to final_model.pt.")
+            return final_fallback, "best-risk-fallback-final", warnings
+    return ckpt_path, cfg.checkpoint_type, warnings
 
 
 def _load_condition_frame(data_dir: Path, split: str) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -63,7 +73,71 @@ def _load_condition_frame(data_dir: Path, split: str) -> tuple[pd.DataFrame, pd.
     return cond_df, meta_df
 
 
-def _filter_conditions(cond_df: pd.DataFrame, cfg: GenerationConfig) -> pd.DataFrame:
+def _parse_candidate_risk_weights(text: str) -> dict[str, float]:
+    weights = {"cum": 1.0, "ramp": 0.3, "duration": 0.3}
+    if not text:
+        return weights
+    for item in str(text).split(","):
+        if not item.strip():
+            continue
+        key, value = item.split(":", 1)
+        weights[key.strip()] = float(value)
+    return weights
+
+
+def _select_risk_guided_candidates(
+    candidates: np.ndarray,
+    selected_cond: pd.DataFrame,
+    out_dir: Path,
+    weights: dict[str, float],
+) -> tuple[np.ndarray, pd.DataFrame]:
+    n, k = candidates.shape[:2]
+    tau = selected_cond["imbalance_tau"].astype(float).to_numpy() if "imbalance_tau" in selected_cond else np.zeros((n,), dtype=float)
+    delta_t = float(selected_cond["delta_t_hours"].astype(float).iloc[0]) if "delta_t_hours" in selected_cond else 1.0
+    flat = candidates.reshape(n * k, candidates.shape[2], candidates.shape[3])
+    tau_rep = np.repeat(tau, k)
+    metrics = batch_hard_risk_metrics(flat, tau=tau_rep, delta_t_hours=delta_t)
+    gen_cum = metrics["cum_deficit"].reshape(n, k)
+    gen_ramp = metrics["netload_ramp_max"].reshape(n, k)
+    gen_dur = metrics["imbalance_duration"].reshape(n, k)
+
+    target_cum = selected_cond["cum_deficit"].astype(float).to_numpy()[:, None]
+    target_ramp = selected_cond["netload_ramp_max"].astype(float).to_numpy()[:, None]
+    target_dur = selected_cond["imbalance_duration"].astype(float).to_numpy()[:, None]
+    cum_scale = np.maximum(np.abs(target_cum), np.nanstd(target_cum) + 1e-6)
+    ramp_scale = np.maximum(np.abs(target_ramp), np.nanstd(target_ramp) + 1e-6)
+    dur_scale = np.maximum(np.abs(target_dur), np.nanstd(target_dur) + 1e-6)
+    score = (
+        float(weights.get("cum", 1.0)) * np.abs(gen_cum - target_cum) / cum_scale
+        + float(weights.get("ramp", 0.3)) * np.abs(gen_ramp - target_ramp) / ramp_scale
+        + float(weights.get("duration", 0.3)) * np.abs(gen_dur - target_dur) / dur_scale
+    )
+    best_idx = score.argmin(axis=1)
+    selected = candidates[np.arange(n), best_idx]
+    rows = []
+    for i in range(n):
+        j = int(best_idx[i])
+        rows.append(
+            {
+                "sample_id": selected_cond.loc[i, "sample_id"],
+                "selected_candidate_idx": j,
+                "selected_score": float(score[i, j]),
+                "target_cum_deficit": float(target_cum[i, 0]),
+                "generated_cum_deficit": float(gen_cum[i, j]),
+                "target_netload_ramp_max": float(target_ramp[i, 0]),
+                "generated_netload_ramp_max": float(gen_ramp[i, j]),
+                "target_imbalance_duration": float(target_dur[i, 0]),
+                "generated_imbalance_duration": float(gen_dur[i, j]),
+                "candidate_score_min": float(score[i].min()),
+                "candidate_score_mean": float(score[i].mean()),
+            }
+        )
+    summary_df = pd.DataFrame(rows)
+    summary_df.to_csv(out_dir / "candidate_selection_summary.csv", index=False, encoding="utf-8-sig")
+    return selected.astype(np.float32), summary_df
+
+
+def _filter_conditions(cond_df: pd.DataFrame, cfg: GenerationConfig) -> tuple[pd.DataFrame, str]:
     out = cond_df.copy()
     if cfg.event_type is not None:
         out = out[out["event_type"] == cfg.event_type]
@@ -71,22 +145,32 @@ def _filter_conditions(cond_df: pd.DataFrame, cfg: GenerationConfig) -> pd.DataF
         out = out[out["month"].astype(int) == int(cfg.month)]
     if cfg.severity_level is not None:
         out = out[out["severity_level"].astype(int) == int(cfg.severity_level)]
+
+    duration_mode = "not_requested"
+    if cfg.duration_hours is not None and not out.empty:
+        duration = pd.to_numeric(out["duration_hours"], errors="coerce")
+        nearest_idx = (duration - float(cfg.duration_hours)).abs().sort_values().index
+        out = out.loc[nearest_idx].copy()
+        out.iloc[0, out.columns.get_loc("duration_hours")] = float(cfg.duration_hours)
+        out = out.iloc[:1].copy()
+        duration_mode = "matched_nearest_and_overwritten"
+
     if cfg.num_samples is not None and len(out) > cfg.num_samples:
         out = out.iloc[: cfg.num_samples].copy()
-    return out
+    return out, duration_mode
 
 
 def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path, resolved_checkpoint_type = _resolve_checkpoint(cfg, out_dir)
+    checkpoint_path, resolved_checkpoint_type, warnings = _resolve_checkpoint(cfg, out_dir)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     data_dir = Path(cfg.data_dir)
 
     cond_df_full, meta_df_full = _load_condition_frame(data_dir, cfg.split)
-    selected_cond = _filter_conditions(cond_df_full, cfg)
+    selected_cond, duration_mode = _filter_conditions(cond_df_full, cfg)
     if selected_cond.empty:
         raise ValueError("No conditions matched the requested filters.")
     selected_meta = meta_df_full.loc[selected_cond.index].reset_index(drop=True)
@@ -128,22 +212,48 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
     proc = torch.from_numpy(arrays["process"]).to(device)
     risk = torch.from_numpy(arrays["risk"]).to(device)
     day_mask = torch.from_numpy(arrays["day_mask"]).to(device)
-    guidance = float(cfg.guidance_scale if cfg.guidance_scale is not None else ckpt["train_config"]["guidance_scale"])
+    guidance = float(cfg.guidance_scale if cfg.guidance_scale is not None else ckpt["train_config"].get("guidance_scale", 1.0))
+    if (
+        ckpt["train_config"].get("ablation") == "full"
+        and cfg.checkpoint_type == "best-risk"
+        and ckpt.get("checkpoint_stage") != "stage3_risk"
+    ):
+        warnings.append("proposed best-risk generation did not use a stage3_risk checkpoint.")
+
+    num_candidates = max(1, int(cfg.num_candidates_per_condition))
+    selection_mode = cfg.candidate_selection_mode.strip().lower()
+    if num_candidates > 1 and selection_mode == "risk_target":
+        bg_sample = bg.repeat_interleave(num_candidates, dim=0)
+        proc_sample = proc.repeat_interleave(num_candidates, dim=0)
+        risk_sample = risk.repeat_interleave(num_candidates, dim=0)
+        day_mask_sample = day_mask.repeat_interleave(num_candidates, dim=0)
+    else:
+        bg_sample, proc_sample, risk_sample, day_mask_sample = bg, proc, risk, day_mask
 
     gen_norm = sample_sequences(
         model=model,
         scheduler=scheduler,
-        bg_cond=bg,
-        proc_cond=proc,
-        risk_cond=risk,
-        shape=(len(selected_cond), int(ckpt["train_config"]["in_channels"]), int(ckpt["seq_len"])),
+        bg_cond=bg_sample,
+        proc_cond=proc_sample,
+        risk_cond=risk_sample,
+        shape=(bg_sample.shape[0], int(ckpt["train_config"]["in_channels"]), int(ckpt["seq_len"])),
         guidance_scale=guidance,
         device=device,
     ).detach()
     x_mean = np.asarray(ckpt["x_mean"], dtype=np.float32)
     x_std = np.asarray(ckpt["x_std"], dtype=np.float32)
     gen_denorm = denormalize_x_np(gen_norm.cpu().numpy(), x_mean, x_std).astype(np.float32)
-    gen_proj = apply_physical_projection(torch.from_numpy(gen_denorm).to(device), day_mask).cpu().numpy().astype(np.float32)
+    gen_proj_all = apply_physical_projection(torch.from_numpy(gen_denorm).to(device), day_mask_sample).cpu().numpy().astype(np.float32)
+    candidate_summary_rows = []
+    candidate_weights = _parse_candidate_risk_weights(cfg.candidate_risk_weights)
+    if num_candidates > 1 and selection_mode == "risk_target":
+        candidates = gen_proj_all.reshape(len(selected_cond), num_candidates, int(ckpt["train_config"]["in_channels"]), int(ckpt["seq_len"]))
+        if cfg.save_generated_candidates:
+            np.save(out_dir / "generated_candidates.npy", candidates.astype(np.float32))
+        gen_proj, candidate_summary = _select_risk_guided_candidates(candidates, selected_cond, out_dir, candidate_weights)
+        candidate_summary_rows = candidate_summary.to_dict(orient="records")
+    else:
+        gen_proj = gen_proj_all
 
     np.save(out_dir / "generated_samples.npy", gen_proj)
     long_rows = []
@@ -159,6 +269,7 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
                     "solar_power": float(gen_proj[i, 2, t]),
                     "event_type": row["event_type"],
                     "month": int(row["month"]),
+                    "duration_hours": float(row.get("duration_hours", np.nan)),
                     "severity_level": int(row["severity_level"]),
                     "extreme_prob": float(row["extreme_prob"]),
                 }
@@ -177,6 +288,15 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_epoch": ckpt.get("checkpoint_epoch"),
         "checkpoint_stage": ckpt.get("checkpoint_stage"),
+        "warnings": warnings,
+        "num_candidates_per_condition": num_candidates,
+        "candidate_selection_mode": selection_mode,
+        "candidate_risk_weights": candidate_weights,
+        "generated_candidates_saved": bool(num_candidates > 1 and selection_mode == "risk_target" and cfg.save_generated_candidates),
+        "candidate_selection_mean_score": float(np.mean([row["selected_score"] for row in candidate_summary_rows])) if candidate_summary_rows else None,
+        "requested_duration_hours": cfg.duration_hours,
+        "actual_condition_duration_hours": selected_cond["duration_hours"].astype(float).tolist() if "duration_hours" in selected_cond else [],
+        "duration_generation_mode": duration_mode,
         "condition_meta": condition_meta,
     }
     (out_dir / "generation_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -188,6 +308,7 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
         model_summary["checkpoint_path_used_for_generation"] = str(checkpoint_path)
         model_summary["checkpoint_epoch_used_for_generation"] = ckpt.get("checkpoint_epoch")
         model_summary["checkpoint_stage_used_for_generation"] = ckpt.get("checkpoint_stage")
+        model_summary["generation_warnings"] = warnings
         model_summary_path.write_text(json.dumps(model_summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
 
@@ -203,10 +324,16 @@ def parse_args() -> GenerationConfig:
     parser.add_argument("--event-type", type=str, default=None)
     parser.add_argument("--month", type=int, default=None)
     parser.add_argument("--severity-level", type=int, default=None)
+    parser.add_argument("--duration-hours", type=float, default=None)
     parser.add_argument("--guidance-scale", type=float, default=None)
+    parser.add_argument("--num-candidates-per-condition", type=int, default=1)
+    parser.add_argument("--candidate-selection-mode", type=str, default="none", choices=["none", "risk_target"])
+    parser.add_argument("--candidate-risk-weights", type=str, default="cum:1.0,ramp:0.3,duration:0.3")
+    parser.add_argument("--save-generated-candidates", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
     return GenerationConfig(
         checkpoint=args.checkpoint,
+        checkpoint_type=args.checkpoint_type,
         data_dir=args.data_dir,
         out_dir=args.out_dir,
         split=args.split,
@@ -214,8 +341,12 @@ def parse_args() -> GenerationConfig:
         event_type=args.event_type,
         month=args.month,
         severity_level=args.severity_level,
+        duration_hours=args.duration_hours,
         guidance_scale=args.guidance_scale,
-        checkpoint_type=args.checkpoint_type,
+        num_candidates_per_condition=args.num_candidates_per_condition,
+        candidate_selection_mode=args.candidate_selection_mode,
+        candidate_risk_weights=args.candidate_risk_weights,
+        save_generated_candidates=args.save_generated_candidates,
     )
 
 

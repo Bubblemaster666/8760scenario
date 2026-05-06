@@ -6,14 +6,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from risk_metrics import (
-    RiskMetricConfig,
-    build_tau_diagnostic,
-    hard_risk_metrics_from_net_load,
-    month_to_season,
-    prepare_net_load_frame,
-    resolve_context_tau,
-)
+from risk_metrics import RiskMetricConfig, build_tau_diagnostic, hard_risk_metrics_from_net_load, month_to_season, prepare_net_load_frame, resolve_context_tau
 
 
 @dataclass
@@ -41,39 +34,14 @@ def _to_risk_config(cfg: MetricConfig) -> RiskMetricConfig:
     )
 
 
-def compute_metrics_for_samples(
-    df: pd.DataFrame,
-    samples: pd.DataFrame,
-    cfg: Optional[MetricConfig] = None,
-) -> pd.DataFrame:
-    """
-    Compute a unified set of joint imbalance risk metrics for each event window.
-
-    Net load:
-        N(t) = L(t) - W(t) - S(t)
-
-    cum_deficit:
-        sum(max(0, N(t) - tau)) * delta_t
-        If tau == 0, this degenerates to sum(max(0, N(t))) * delta_t.
-
-    netload_ramp_max:
-        max(N(t) - N(t-1))
-
-    imbalance_duration:
-        sum(1(N(t) > tau)) * delta_t
-
-    Training may use a differentiable soft-duration surrogate, but evaluation and
-    exported labels always use the hard-threshold definition above.
-    """
+def compute_metrics_for_samples(df: pd.DataFrame, samples: pd.DataFrame, cfg: Optional[MetricConfig] = None) -> pd.DataFrame:
     cfg = cfg or MetricConfig()
     if samples.empty:
         return samples.copy()
-
     required_sample_cols = {"sample_id", "event_type", "start_time", "end_time"}
     missing_sample_cols = required_sample_cols - set(samples.columns)
     if missing_sample_cols:
         raise ValueError(f"samples is missing required columns: {sorted(missing_sample_cols)}")
-
     required_df_cols = {cfg.time_col, cfg.load_col, cfg.wind_power_col, cfg.solar_power_col}
     missing_df_cols = required_df_cols - set(df.columns)
     if missing_df_cols:
@@ -83,15 +51,10 @@ def compute_metrics_for_samples(
     prepared_df, delta_t_hours = prepare_net_load_frame(df, risk_cfg)
     tau_diagnostic = build_tau_diagnostic(prepared_df, risk_cfg)
     out_rows = []
-
     for _, row in samples.iterrows():
         start_time = pd.to_datetime(row["start_time"])
         end_time = pd.to_datetime(row["end_time"])
-        sub = prepared_df[
-            (prepared_df[cfg.time_col] >= start_time) &
-            (prepared_df[cfg.time_col] <= end_time)
-        ].copy()
-
+        sub = prepared_df[(prepared_df[cfg.time_col] >= start_time) & (prepared_df[cfg.time_col] <= end_time)].copy()
         rec = row.to_dict()
         month = int(row.get("month", pd.Timestamp(row.get("core_start_time", start_time)).month))
         season = str(row.get("season", month_to_season(month)))
@@ -99,7 +62,6 @@ def compute_metrics_for_samples(
         rec["imbalance_tau"] = tau
         rec["imbalance_tau_mode"] = cfg.imbalance_tau_mode
         rec["delta_t_hours"] = delta_t_hours
-
         if sub.empty:
             rec["cum_deficit"] = np.nan
             rec["netload_ramp_max"] = np.nan
@@ -108,15 +70,8 @@ def compute_metrics_for_samples(
             rec["netload_mean"] = np.nan
             out_rows.append(rec)
             continue
-
-        metrics = hard_risk_metrics_from_net_load(
-            sub["net_load"].to_numpy(dtype=float),
-            tau=tau,
-            delta_t_hours=delta_t_hours,
-        )
-        rec.update(metrics)
+        rec.update(hard_risk_metrics_from_net_load(sub["net_load"].to_numpy(dtype=float), tau=tau, delta_t_hours=delta_t_hours))
         out_rows.append(rec)
-
     out = pd.DataFrame(out_rows)
     out.attrs["tau_diagnostic"] = tau_diagnostic
     return out
@@ -125,34 +80,6 @@ def compute_metrics_for_samples(
 if __name__ == "__main__":
     rng = np.random.default_rng(0)
     time = pd.date_range("2024-01-01 00:00:00", periods=48, freq="1h")
-
-    df_demo = pd.DataFrame(
-        {
-            "time": time,
-            "load": 600 + rng.normal(0, 10, 48),
-            "wind_power": 150 + rng.normal(0, 15, 48),
-            "solar_power": np.maximum(0, 200 * np.sin((time.hour.to_numpy() - 6) / 12 * np.pi)),
-        }
-    )
-
-    idx = (
-        (df_demo["time"] >= "2024-01-01 10:00:00") &
-        (df_demo["time"] <= "2024-01-01 20:00:00")
-    )
-    df_demo.loc[idx, "load"] += 80
-    df_demo.loc[idx, "wind_power"] *= 0.5
-    df_demo.loc[idx, "solar_power"] *= 0.3
-
-    samples_demo = pd.DataFrame(
-        {
-            "sample_id": ["S0001"],
-            "event_type": ["寒潮"],
-            "start_time": [pd.Timestamp("2024-01-01 08:00:00")],
-            "end_time": [pd.Timestamp("2024-01-01 22:00:00")],
-            "low_irradiance_flag": [1],
-            "low_wind_flag": [1],
-        }
-    )
-
-    result = compute_metrics_for_samples(df_demo, samples_demo, MetricConfig())
-    print(result)
+    df_demo = pd.DataFrame({"time": time, "load": 600 + rng.normal(0, 10, 48), "wind_power": 150 + rng.normal(0, 15, 48), "solar_power": np.maximum(0, 200 * np.sin((time.hour.to_numpy() - 6) / 12 * np.pi))})
+    samples_demo = pd.DataFrame({"sample_id": ["S0001"], "event_type": ["寒潮"], "start_time": [pd.Timestamp("2024-01-01 08:00:00")], "end_time": [pd.Timestamp("2024-01-01 22:00:00")], "low_irradiance_flag": [1], "low_wind_flag": [1]})
+    print(compute_metrics_for_samples(df_demo, samples_demo, MetricConfig()))

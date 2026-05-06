@@ -102,12 +102,9 @@ def build_condition_bundle(
     if ablation == "no_month":
         month_slice = slice(event_onehot.shape[1], event_onehot.shape[1] + 2)
         bg[:, month_slice] = 0.0
-    if ablation in {"no_evt", "no_evt_continuous"}:
+    if ablation == "no_evt":
         # Keep severity as an ordinal risk hint, but remove continuous EVT features.
         risk[:, 0:2] = 0.0
-    if ablation == "no_evt_strict":
-        # Strict EVT ablation removes the whole risk layer signal.
-        risk[:, :] = 0.0
 
     day_mask = infer_day_mask(meta_df, seq_len, daylight_start_hour, daylight_end_hour)
     risk_targets = cond_df[
@@ -167,8 +164,10 @@ class ConditionedWindowDataset(Dataset):
         seq_len: int,
         ablation: str = "full",
         normalizers: Optional[ConditionNormalizers] = None,
+        expected_event_types: Optional[int] = None,
         daylight_start_hour: int = 6,
         daylight_end_hour: int = 18,
+        event_mask: Optional[np.ndarray] = None,
     ) -> None:
         if x.ndim != 3 or x.shape[1] != 3:
             raise ValueError("Expected X with shape [N, 3, T].")
@@ -182,7 +181,7 @@ class ConditionedWindowDataset(Dataset):
             seq_len=seq_len,
             ablation=ablation,
             normalizers=normalizers,
-            expected_event_types=None,
+            expected_event_types=expected_event_types,
             daylight_start_hour=daylight_start_hour,
             daylight_end_hour=daylight_end_hour,
         )
@@ -191,7 +190,16 @@ class ConditionedWindowDataset(Dataset):
         self.risk = arrays["risk"]
         self.day_mask = arrays["day_mask"]
         self.risk_targets = arrays["risk_targets"]
+        if event_mask is None:
+            self.event_mask = np.ones((len(self.X), seq_len), dtype=np.float32)
+            self.event_mask_available = False
+        else:
+            if event_mask.shape != (len(self.X), seq_len):
+                raise ValueError(f"Expected event_mask with shape {(len(self.X), seq_len)}, got {event_mask.shape}.")
+            self.event_mask = event_mask.astype(np.float32)
+            self.event_mask_available = True
         self.condition_meta = layout
+        self.condition_meta["event_mask_available"] = self.event_mask_available
 
     def __len__(self) -> int:
         return len(self.X)
@@ -204,6 +212,7 @@ class ConditionedWindowDataset(Dataset):
             torch.from_numpy(self.risk[idx]),
             torch.from_numpy(self.risk_targets[idx]),
             torch.from_numpy(self.day_mask[idx]),
+            torch.from_numpy(self.event_mask[idx]),
         )
 
 
@@ -551,9 +560,13 @@ def sample_sequences(
     return x
 
 
-def load_split_arrays(data_dir: str | Path, split: str) -> tuple[np.ndarray, pd.DataFrame, pd.DataFrame]:
+def load_split_arrays(data_dir: str | Path, split: str, include_event_mask: bool = False):
     root = Path(data_dir)
     x = np.load(root / f"X_{split}.npy").astype(np.float32)
     cond_df = pd.read_csv(root / f"cond_{split}.csv")
     meta_df = pd.read_csv(root / f"meta_{split}.csv")
+    if include_event_mask:
+        mask_path = root / f"event_mask_{split}.npy"
+        event_mask = np.load(mask_path).astype(np.float32) if mask_path.exists() else None
+        return x, cond_df, meta_df, event_mask
     return x, cond_df, meta_df

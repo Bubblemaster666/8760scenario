@@ -68,6 +68,7 @@ def _event_type_summary(df: pd.DataFrame) -> pd.DataFrame:
     if "event_type" not in df.columns:
         return pd.DataFrame()
     rows: list[dict[str, Any]] = []
+    total = max(len(df), 1)
     for event_type, sub in df.groupby("event_type"):
         cum = pd.to_numeric(sub.get("cum_deficit", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
         ramp = pd.to_numeric(sub.get("netload_ramp_max", pd.Series(dtype=float)), errors="coerce")
@@ -78,6 +79,7 @@ def _event_type_summary(df: pd.DataFrame) -> pd.DataFrame:
             {
                 "event_type": event_type,
                 "count": int(len(sub)),
+                "count_ratio": float(len(sub) / total),
                 "cum_deficit_mean": float(cum.mean()),
                 "cum_deficit_median": float(cum.median()),
                 "cum_deficit_q75": _q(cum, 0.75),
@@ -90,6 +92,9 @@ def _event_type_summary(df: pd.DataFrame) -> pd.DataFrame:
                 "imbalance_duration_q90": _q(dur, 0.90),
                 "low_wind_ratio": float(low_wind.mean()) if len(low_wind) else 0.0,
                 "low_irradiance_ratio": float(low_irr.mean()) if len(low_irr) else 0.0,
+                "severity_distribution": _json_counts(
+                    pd.to_numeric(sub.get("severity_level", pd.Series(dtype=float)), errors="coerce").fillna(0).astype(int)
+                ),
             }
         )
     return pd.DataFrame(rows).sort_values("count", ascending=False)
@@ -149,9 +154,20 @@ def _diagnostic_summary(df: pd.DataFrame, event_summary: pd.DataFrame) -> dict[s
     low_wind_count = int(pd.to_numeric(df.get("low_wind_flag", 0), errors="coerce").fillna(0).sum())
     low_irr_count = int(pd.to_numeric(df.get("low_irradiance_flag", 0), errors="coerce").fillna(0).sum())
     snow_count = 0
+    heavy_rain_mask = pd.Series(False, index=df.index)
     if "event_type" in df.columns:
         snow_mask = df["event_type"].astype(str).str.contains("雪|snow|blizzard", case=False, regex=True, na=False)
         snow_count = int(snow_mask.sum())
+        heavy_rain_mask = df["event_type"].astype(str).eq("暴雨/强降水")
+
+    heavy_rain = df.loc[heavy_rain_mask].copy()
+    heavy_rain_n = int(len(heavy_rain))
+    heavy_rain_ratio = float(heavy_rain_n / n)
+    heavy_severity = pd.to_numeric(heavy_rain.get("severity_level", pd.Series(dtype=float)), errors="coerce").fillna(0).astype(int)
+    heavy_cum = pd.to_numeric(heavy_rain.get("cum_deficit", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+    heavy_low_irr = pd.to_numeric(heavy_rain.get("low_irradiance_flag", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+    heavy_sev0_ratio = float((heavy_severity == 0).mean()) if heavy_rain_n > 0 else 0.0
+    heavy_low_power_ratio = float(((heavy_cum <= 1e-12) & (heavy_low_irr <= 0)).mean()) if heavy_rain_n > 0 else 0.0
 
     warnings: list[str] = []
     flags = {
@@ -162,6 +178,9 @@ def _diagnostic_summary(df: pd.DataFrame, event_summary: pd.DataFrame) -> dict[s
         "many_zero_cum_deficit": float((cum <= 1e-12).mean()) > 0.35,
         "snow_samples_too_few": snow_count < 5,
         "high_risk_only_one_event_type": bool(len(high_risk) > 0 and high_risk.get("event_type", pd.Series(dtype=object)).nunique() <= 1),
+        "heavy_rain_too_many": heavy_rain_ratio > 0.50,
+        "heavy_rain_mostly_low_risk": heavy_sev0_ratio > 0.75,
+        "heavy_rain_low_power_impact": heavy_low_power_ratio > 0.50,
     }
     for key, value in flags.items():
         if value:
@@ -175,6 +194,10 @@ def _diagnostic_summary(df: pd.DataFrame, event_summary: pd.DataFrame) -> dict[s
         "low_wind_flag_count": low_wind_count,
         "low_irradiance_flag_count": low_irr_count,
         "cum_deficit_zero_ratio": float((cum <= 1e-12).mean()) if len(cum) else 0.0,
+        "heavy_rain_count": heavy_rain_n,
+        "heavy_rain_ratio": heavy_rain_ratio,
+        "heavy_rain_severity0_ratio": heavy_sev0_ratio,
+        "heavy_rain_low_power_impact_ratio": heavy_low_power_ratio,
         "snow_sample_count": snow_count,
         "warnings": warnings,
         "rare_event_type_suggestion": "Keep rare weather events for total-data training or case analysis, but avoid separate per-event claims when count < 5.",

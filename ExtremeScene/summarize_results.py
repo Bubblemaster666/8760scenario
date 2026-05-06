@@ -14,34 +14,37 @@ STAT_METRICS = [
 ]
 
 RISK_LOWER_BETTER = [
-    "cum_deficit_mae",
-    "q95_cum_deficit_error",
+    "highrisk_wasserstein",
+    "highrisk_acf_mae",
     "q99_cum_deficit_error",
+    "core_q99_cum_deficit_error",
     "netload_ramp_max_mae",
     "imbalance_duration_mae",
 ]
 
 RISK_HIGHER_BETTER = [
     "extreme_degree_match_rate",
-    "extreme_degree_adjacent_match_rate",
 ]
 
 RISK_WEIGHTS = {
-    "cum_deficit_mae": 2.0,
-    "q95_cum_deficit_error": 1.5,
+    "highrisk_wasserstein": 1.0,
+    "highrisk_acf_mae": 1.0,
     "q99_cum_deficit_error": 2.0,
+    "core_q99_cum_deficit_error": 2.0,
     "netload_ramp_max_mae": 1.0,
     "imbalance_duration_mae": 1.0,
-    "extreme_degree_match_rate": 1.0,
-    "extreme_degree_adjacent_match_rate": 0.5,
+    "extreme_degree_match_rate": 1.5,
 }
 
-STAT_TOLERANCE = {
-    "mean_wasserstein": 0.25,
-    "mean_js": 0.25,
-    "acf_mae": 0.30,
-    "corr_matrix_error": 0.30,
-}
+PAPER_MAIN_METRICS = [
+    "highrisk_wasserstein",
+    "highrisk_acf_mae",
+    "extreme_degree_match_rate",
+    "q99_cum_deficit_error",
+    "core_q99_cum_deficit_error",
+    "netload_ramp_max_mae",
+    "imbalance_duration_mae",
+]
 
 MAIN_COMPARE_ORDER = [
     "traditional_gaussian_copula",
@@ -128,7 +131,7 @@ def normalize_row(row: dict[str, str], group: str, source_file: Path, note: str 
         if extra in row:
             out[extra] = row[extra]
     out["statistical_metrics"] = json.dumps({m: out.get(m) for m in STAT_METRICS}, ensure_ascii=False)
-    out["risk_metrics"] = json.dumps({m: out.get(m) for m in RISK_LOWER_BETTER + RISK_HIGHER_BETTER}, ensure_ascii=False)
+    out["extreme_metrics"] = json.dumps({m: out.get(m) for m in RISK_LOWER_BETTER + RISK_HIGHER_BETTER}, ensure_ascii=False)
     return out
 
 
@@ -189,47 +192,23 @@ def attach_risk_oriented_scores(rows: list[dict[str, object]]) -> None:
     for metric in RISK_LOWER_BETTER:
         ranks = _rank_values(rows, metric, ascending=True)
         for idx, rank in ranks.items():
-            rows[idx][f"{metric}_risk_rank"] = rank
+            rows[idx][f"{metric}_extreme_rank"] = rank
             rows[idx][f"{metric}_weighted_rank"] = rank * RISK_WEIGHTS[metric]
     for metric in RISK_HIGHER_BETTER:
         ranks = _rank_values(rows, metric, ascending=False)
         for idx, rank in ranks.items():
-            rows[idx][f"{metric}_risk_rank"] = rank
+            rows[idx][f"{metric}_extreme_rank"] = rank
             rows[idx][f"{metric}_weighted_rank"] = rank * RISK_WEIGHTS[metric]
 
-    total_weight = sum(RISK_WEIGHTS.values())
     for row in rows:
         weighted_sum = 0.0
         used_weight = 0.0
         for metric, weight in RISK_WEIGHTS.items():
-            rank = row.get(f"{metric}_risk_rank")
+            rank = row.get(f"{metric}_extreme_rank")
             if isinstance(rank, int):
                 weighted_sum += rank * weight
                 used_weight += weight
-        row["risk_rank_score"] = round(weighted_sum / used_weight, 4) if used_weight else None
-
-    best_stats = _baseline_best_stats(rows)
-    for row in rows:
-        penalty = 0.0
-        max_excess = 0.0
-        degradation_details = {}
-        for metric, tolerance in STAT_TOLERANCE.items():
-            value = row.get(metric)
-            best = best_stats.get(metric)
-            if not isinstance(value, float) or best is None:
-                continue
-            degradation = (value - best) / (abs(best) + 1e-8)
-            excess = max(0.0, degradation - tolerance)
-            row[f"{metric}_degradation"] = degradation
-            degradation_details[metric] = round(degradation, 4)
-            penalty += excess
-            max_excess = max(max_excess, excess)
-        row["statistical_degradation_score"] = round(max_excess, 4)
-        row["statistical_penalty"] = round(penalty, 4)
-        risk_score = row.get("risk_rank_score")
-        row["final_risk_oriented_score"] = round(float(risk_score) + penalty, 4) if isinstance(risk_score, float) else None
-        row["statistical_degradation_details"] = json.dumps(degradation_details, ensure_ascii=False)
-        row["statistical_status"] = _statistical_status(row)
+        row["final_extreme_score"] = round(weighted_sum / used_weight, 4) if used_weight else None
         row["recommendation_reason"] = _recommendation_reason(row)
 
 
@@ -247,18 +226,25 @@ def _statistical_status(row: dict[str, object]) -> str:
 
 
 def _recommendation_reason(row: dict[str, object]) -> str:
-    status = row.get("statistical_status")
-    risk_score = row.get("risk_rank_score")
-    acf_excess = float(row.get("acf_mae_degradation") or 0.0) - STAT_TOLERANCE["acf_mae"]
-    if status == "unacceptable":
-        return "not recommended due to statistical degradation"
-    if isinstance(risk_score, float) and risk_score <= 3.0 and status == "acceptable":
-        return "risk metrics improved while statistical metrics remain acceptable"
-    if isinstance(risk_score, float) and risk_score <= 3.0 and status == "slightly_worse":
-        return "risk-preferred but temporal-continuity slightly worse" if acf_excess > 0 else "risk improved with slight statistical degradation"
-    if status == "acceptable":
-        return "good distribution but weak risk improvement"
-    return "risk improved but ACF degradation is too large" if acf_excess > 0 else "mixed trade-off"
+    q99_rank = row.get("q99_cum_deficit_error_extreme_rank")
+    core_q99_rank = row.get("core_q99_cum_deficit_error_extreme_rank")
+    match_rank = row.get("extreme_degree_match_rate_extreme_rank")
+    highrisk_w_rank = row.get("highrisk_wasserstein_extreme_rank")
+    highrisk_acf_rank = row.get("highrisk_acf_mae_extreme_rank")
+    ramp_rank = row.get("netload_ramp_max_mae_extreme_rank")
+    tail_good = all(isinstance(rank, int) and rank <= 3 for rank in [q99_rank, core_q99_rank, match_rank])
+    dist_good = all(isinstance(rank, int) and rank <= 3 for rank in [highrisk_w_rank, highrisk_acf_rank])
+    risk_good = all(isinstance(rank, int) and rank <= 3 for rank in [q99_rank, core_q99_rank])
+    ramp_weak = isinstance(ramp_rank, int) and ramp_rank >= 5
+    if tail_good:
+        return "recommended due to strong tail-risk and extreme-degree performance"
+    if dist_good and not risk_good:
+        return "good high-risk conditional distribution but weak risk matching"
+    if risk_good and not dist_good:
+        return "risk improved but high-risk conditional distribution needs review"
+    if ramp_weak:
+        return "tail risk is acceptable but ramp process is weak"
+    return "not recommended for extreme scenario generation"
 
 
 def sort_by_order(rows: list[dict[str, object]], order: list[str]) -> list[dict[str, object]]:
@@ -310,15 +296,17 @@ def build_markdown(dataset_context: dict[str, object], main_rows: list[dict[str,
         [
             "## Evaluation Logic",
             "",
-            "The proposed method is selected by a risk-first, statistics-constrained rule. Wasserstein, JS, ACF, and correlation matrix error are used to check that statistical realism is not obviously degraded; cumulative deficit, tail cumulative deficit, ramp, duration, and severity matching drive the risk-oriented score.",
+            "本文研究对象为重大天气事件下的风光荷联合极端场景生成，而非无条件常规场景生成。因此，正文主评价指标聚焦极端条件下的分布真实性、极端等级控制能力以及联合失衡风险刻画能力。全样本 Wasserstein、JS、ACF 和相关矩阵误差仅作为辅助诊断指标，用于判断生成结果是否发生明显整体失真，不作为方法优劣判断的主要依据。",
             "",
             "## Main Comparison",
             "",
         ]
     )
-    lines.append(markdown_table(main_rows, ["experiment_name", *STAT_METRICS, "cum_deficit_mae", "q99_cum_deficit_error", "netload_ramp_max_mae", "imbalance_duration_mae", "extreme_degree_match_rate", "final_risk_oriented_score", "statistical_status", "recommendation_reason"]))
+    lines.append(markdown_table(main_rows, ["experiment_name", *PAPER_MAIN_METRICS, "final_extreme_score", "recommendation_reason"]))
     lines.extend(["", "## Ablation", ""])
-    lines.append(markdown_table(ablation_rows, ["experiment_name", "cum_deficit_mae", "q95_cum_deficit_error", "q99_cum_deficit_error", "netload_ramp_max_mae", "imbalance_duration_mae", "corr_matrix_error", "extreme_degree_match_rate", "final_risk_oriented_score", "recommendation_reason"]))
+    lines.append(markdown_table(ablation_rows, ["experiment_name", *PAPER_MAIN_METRICS, "final_extreme_score", "recommendation_reason"]))
+    lines.extend(["", "## Auxiliary Global Statistical Diagnostics", ""])
+    lines.append(markdown_table(main_rows, ["experiment_name", *STAT_METRICS]))
     return "\n".join(lines)
 
 
@@ -336,22 +324,18 @@ def main() -> None:
         [row for row in rows if row.get("group") == "main_compare" and row.get("experiment_name") in ABLATION_ORDER],
         ABLATION_ORDER,
     )
-    key_rows = sorted(rows, key=lambda row: float(row.get("final_risk_oriented_score") or 1e9))[:12]
+    key_rows = sorted(rows, key=lambda row: float(row.get("final_extreme_score") or 1e9))[:12]
 
     common_fields = [
         "group",
         "experiment_name",
         "status",
         "statistical_metrics",
-        "risk_metrics",
+        "extreme_metrics",
         *STAT_METRICS,
         *RISK_LOWER_BETTER,
         *RISK_HIGHER_BETTER,
-        "risk_rank_score",
-        "statistical_degradation_score",
-        "statistical_penalty",
-        "final_risk_oriented_score",
-        "statistical_status",
+        "final_extreme_score",
         "recommendation_reason",
         "severity_classification_method",
         "checkpoint_type_used_for_generation",
@@ -365,12 +349,17 @@ def main() -> None:
     write_csv(
         args.out_dir / "main_compare_paper_table.csv",
         main_rows,
-        ["experiment_name", *STAT_METRICS, "cum_deficit_mae", "q99_cum_deficit_error", "netload_ramp_max_mae", "imbalance_duration_mae", "extreme_degree_match_rate", "final_risk_oriented_score", "statistical_status", "recommendation_reason"],
+        ["experiment_name", *PAPER_MAIN_METRICS, "final_extreme_score", "recommendation_reason"],
+    )
+    write_csv(
+        args.out_dir / "auxiliary_global_stat_table.csv",
+        main_rows,
+        ["experiment_name", *STAT_METRICS],
     )
     write_csv(
         args.out_dir / "ablation_paper_table.csv",
         ablation_rows,
-        ["experiment_name", "cum_deficit_mae", "q95_cum_deficit_error", "q99_cum_deficit_error", "netload_ramp_max_mae", "imbalance_duration_mae", "corr_matrix_error", "extreme_degree_match_rate", "final_risk_oriented_score", "statistical_status", "recommendation_reason"],
+        ["experiment_name", *PAPER_MAIN_METRICS, "final_extreme_score", "recommendation_reason"],
     )
 
     markdown = build_markdown(load_dataset_context(args.dataset_summary), main_rows, ablation_rows)
