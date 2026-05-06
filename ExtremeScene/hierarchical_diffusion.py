@@ -62,6 +62,8 @@ def build_condition_bundle(
     expected_event_types: Optional[int] = None,
     daylight_start_hour: int = 6,
     daylight_end_hour: int = 18,
+    use_risk_profile_condition: bool = False,
+    use_mask_condition: bool = False,
 ) -> tuple[dict[str, np.ndarray], dict]:
     cond_df = cond_df.reset_index(drop=True).copy()
     meta_df = meta_df.reset_index(drop=True).copy()
@@ -97,7 +99,46 @@ def build_condition_bundle(
 
     bg = np.concatenate([event_onehot, month_sin, month_cos, season_onehot], axis=1).astype(np.float32)
     proc = np.concatenate([low_wind, low_irr, duration_z, start_hour_sin, start_hour_cos], axis=1).astype(np.float32)
-    risk = np.concatenate([extreme_prob, tail_score_z, severity], axis=1).astype(np.float32)
+
+    risk_parts = [extreme_prob, tail_score_z, severity]
+    risk_layout: dict[str, list[int]] = {
+        "extreme_prob": [0],
+        "tail_score_zscore": [1],
+        "severity_level_scaled": [2],
+    }
+    if use_risk_profile_condition:
+        # cum_level/ramp_level/duration_level 分别表示累计性、突发性和持续性风险强度。
+        # risk_profile_id 是三类风险等级组合形成的联合风险剖面编号。
+        for col, key in [
+            ("cum_level", "cum_level_scaled"),
+            ("ramp_level", "ramp_level_scaled"),
+            ("duration_level", "duration_level_scaled"),
+        ]:
+            offset = sum(part.shape[1] for part in risk_parts)
+            if col in cond_df.columns:
+                values = pd.to_numeric(cond_df[col], errors="coerce").fillna(0.0).clip(0, 3).to_numpy(dtype=np.float32)
+            else:
+                values = np.zeros((len(cond_df),), dtype=np.float32)
+            risk_parts.append((values / 3.0)[:, None])
+            risk_layout[key] = [offset]
+        offset = sum(part.shape[1] for part in risk_parts)
+        if "risk_profile_id" in cond_df.columns:
+            profile = pd.to_numeric(cond_df["risk_profile_id"], errors="coerce").fillna(0.0).clip(0, 63).to_numpy(dtype=np.float32)
+        else:
+            profile = np.zeros((len(cond_df),), dtype=np.float32)
+        risk_parts.append((profile / 63.0)[:, None])
+        risk_layout["risk_profile_id_scaled"] = [offset]
+    if use_mask_condition:
+        # mask_prob_t 是风险过程先验：第 t 个小时净负荷超过失衡阈值 tau 的概率。
+        offset = sum(part.shape[1] for part in risk_parts)
+        mask_cols = [f"mask_prob_{i}" for i in range(seq_len)]
+        if all(col in cond_df.columns for col in mask_cols):
+            mask_prob = cond_df[mask_cols].astype(float).fillna(0.0).clip(0.0, 1.0).to_numpy(dtype=np.float32)
+        else:
+            mask_prob = np.zeros((len(cond_df), seq_len), dtype=np.float32)
+        risk_parts.append(mask_prob)
+        risk_layout["mask_condition"] = list(range(offset, offset + seq_len))
+    risk = np.concatenate(risk_parts, axis=1).astype(np.float32)
 
     if ablation == "no_month":
         month_slice = slice(event_onehot.shape[1], event_onehot.shape[1] + 2)
@@ -107,7 +148,7 @@ def build_condition_bundle(
         risk[:, 0:2] = 0.0
 
     day_mask = infer_day_mask(meta_df, seq_len, daylight_start_hour, daylight_end_hour)
-    risk_targets = cond_df[
+    risk_targets_df = cond_df[
         [
             "cum_deficit",
             "netload_ramp_max",
@@ -116,7 +157,10 @@ def build_condition_bundle(
             "extreme_prob",
             "severity_level",
         ]
-    ].to_numpy(dtype=np.float32)
+    ].copy()
+    for col in ["cum_level", "ramp_level", "duration_level", "risk_profile_id"]:
+        risk_targets_df[col] = pd.to_numeric(cond_df[col], errors="coerce").fillna(0.0) if col in cond_df.columns else 0.0
+    risk_targets = risk_targets_df.to_numpy(dtype=np.float32)
 
     layout = {
         "background": {
@@ -132,11 +176,7 @@ def build_condition_bundle(
             "start_hour_sin": [3],
             "start_hour_cos": [4],
         },
-        "risk": {
-            "extreme_prob": [0],
-            "tail_score_zscore": [1],
-            "severity_level_scaled": [2],
-        },
+        "risk": risk_layout,
         "ablation": ablation,
         "normalizers": {
             "duration_mean": normalizers.duration_mean,
@@ -168,6 +208,8 @@ class ConditionedWindowDataset(Dataset):
         daylight_start_hour: int = 6,
         daylight_end_hour: int = 18,
         event_mask: Optional[np.ndarray] = None,
+        use_risk_profile_condition: bool = False,
+        use_mask_condition: bool = False,
     ) -> None:
         if x.ndim != 3 or x.shape[1] != 3:
             raise ValueError("Expected X with shape [N, 3, T].")
@@ -184,6 +226,8 @@ class ConditionedWindowDataset(Dataset):
             expected_event_types=expected_event_types,
             daylight_start_hour=daylight_start_hour,
             daylight_end_hour=daylight_end_hour,
+            use_risk_profile_condition=use_risk_profile_condition,
+            use_mask_condition=use_mask_condition,
         )
         self.background = arrays["background"]
         self.process = arrays["process"]
@@ -551,11 +595,58 @@ def sample_sequences(
     shape: tuple[int, int, int],
     guidance_scale: float,
     device: torch.device,
+    day_mask: Optional[torch.Tensor] = None,
+    x_mean: Optional[torch.Tensor] = None,
+    x_std: Optional[torch.Tensor] = None,
+    risk_guidance_classifier: Optional[nn.Module] = None,
+    risk_guidance_targets: Optional[dict[str, torch.Tensor]] = None,
+    risk_guidance_scale: float = 0.0,
+    risk_guidance_start_step_ratio: float = 0.5,
+    risk_guidance_interval: int = 5,
+    classifier_x_mean: Optional[torch.Tensor] = None,
+    classifier_x_std: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     model.eval()
+    if risk_guidance_classifier is not None:
+        risk_guidance_classifier.eval()
     x = torch.randn(shape, device=device)
+    start_step = int(scheduler.steps * float(risk_guidance_start_step_ratio))
+    interval = max(1, int(risk_guidance_interval))
     for step in reversed(range(scheduler.steps)):
         t = torch.full((shape[0],), step, device=device, dtype=torch.long)
+        use_risk_guidance = (
+            risk_guidance_classifier is not None
+            and risk_guidance_targets is not None
+            and float(risk_guidance_scale) > 0
+            and step <= start_step
+            and (step % interval == 0)
+            and x_mean is not None
+            and x_std is not None
+        )
+        if use_risk_guidance:
+            # Classifier guidance 只使用 cond 中的目标风险等级，不使用真实测试曲线。
+            x_req = x.detach().requires_grad_(True)
+            pred_cond = model(x_req, t, bg_cond, proc_cond, risk_cond)
+            if guidance_scale != 1.0:
+                pred_uncond = model(x_req, t, None, None, None)
+                pred_noise = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
+            else:
+                pred_noise = pred_cond
+            x0_norm = scheduler.predict_x0(x_req, t, pred_noise).clamp(-5.0, 5.0)
+            x0_denorm = denormalize_x_torch(x0_norm, x_mean, x_std)
+            if day_mask is not None:
+                x0_denorm = apply_physical_projection(x0_denorm, day_mask)
+            clf_x = x0_denorm
+            if classifier_x_mean is not None and classifier_x_std is not None:
+                clf_x = (clf_x - classifier_x_mean) / (classifier_x_std + 1e-6)
+            logits = risk_guidance_classifier(clf_x)
+            loss = torch.tensor(0.0, device=device)
+            for key in ["cum_level", "ramp_level", "duration_level", "severity_level"]:
+                if key in logits and key in risk_guidance_targets:
+                    loss = loss + F.cross_entropy(logits[key], risk_guidance_targets[key].long().to(device))
+            grad = torch.autograd.grad(loss, x_req, retain_graph=False, create_graph=False)[0]
+            grad_scale = grad.flatten(1).std(dim=1).view(-1, 1, 1).clamp(min=1e-6)
+            x = (x_req - float(risk_guidance_scale) * grad / grad_scale).detach()
         x = scheduler.p_sample(model, x, t, bg_cond, proc_cond, risk_cond, guidance_scale)
     return x
 

@@ -109,6 +109,31 @@ class TrainConfig:
     # Stage 3 逐时刻超阈值掩码损失权重，用于学习每个小时是否超过失衡阈值 tau。
     lambda_exceed_mask_stage3: float = 0.0
 
+    # JRPD: ??????????????????? E0 proposed ??????
+    use_risk_profile_condition: bool = False
+    risk_profile_embed_dim: int = 8
+    risk_profile_cum_alpha: float = 0.5
+    risk_profile_ramp_alpha: float = 0.2
+    risk_profile_duration_balance: bool = True
+    use_profile_loss: bool = False
+    lambda_profile: float = 0.0
+
+    # MaskPrior-Diffusion: ??????????????????????
+    use_mask_prior: bool = False
+    lambda_mask_prior: float = 0.0
+    use_mask_condition: bool = False
+    mask_condition_dropout: float = 0.2
+    mask_condition_dim: int = 36
+    use_mask_consistency_loss: bool = False
+    lambda_mask_consistency: float = 0.0
+    mask_temperature: float = 0.1
+
+    # RiskClassifier-Guidance: ??????????????????????
+    risk_guidance_mode: str = "none"
+    risk_guidance_scale: float = 0.0
+    risk_guidance_start_step_ratio: float = 0.5
+    risk_guidance_interval: int = 5
+
     duration_temp: float = 12.0
     delta_t_hours: float = 1.0
     daylight_start_hour: int = 6
@@ -218,6 +243,7 @@ def stage_weights(stage: str, cfg: TrainConfig) -> dict[str, float]:
         "lambda_shape_moment": 0.0,
         "lambda_duration_over": 0.0,
         "lambda_exceed_mask": 0.0,
+        "lambda_profile": 0.0,
         "lambda_recon": cfg.lambda_recon,
         "lambda_physics": cfg.lambda_physics,
         "lambda_resource": 0.0,
@@ -238,6 +264,9 @@ def stage_weights(stage: str, cfg: TrainConfig) -> dict[str, float]:
         weights["lambda_shape_moment"] = cfg.lambda_shape_stage3
         weights["lambda_duration_over"] = cfg.lambda_duration_over_stage3
         weights["lambda_exceed_mask"] = cfg.lambda_exceed_mask_stage3
+        if cfg.use_mask_consistency_loss:
+            weights["lambda_exceed_mask"] = max(weights["lambda_exceed_mask"], cfg.lambda_mask_consistency)
+        weights["lambda_profile"] = cfg.lambda_profile if cfg.use_profile_loss else 0.0
     return weights
 
 
@@ -284,6 +313,51 @@ def _parse_severity_sample_weights(text: str) -> dict[int, float]:
     return weights
 
 
+class RiskProfileHead(nn.Module):
+    """Lightweight auxiliary head for JRPD profile consistency.
+
+    Input x is [B, 3, T] after physical projection. The head predicts three
+    4-class risk morphology labels: cumulative deficit, ramp pressure, and
+    duration pressure. It is used only during training and is saved in summary
+    diagnostics rather than used at generation time.
+    """
+
+    def __init__(self, in_channels: int = 3, hidden: int = 32) -> None:
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Conv1d(in_channels, hidden, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv1d(hidden, hidden, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.cum_head = nn.Linear(hidden, 4)
+        self.ramp_head = nn.Linear(hidden, 4)
+        self.duration_head = nn.Linear(hidden, 4)
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        h = self.backbone(x).squeeze(-1)
+        return {
+            "cum_level": self.cum_head(h),
+            "ramp_level": self.ramp_head(h),
+            "duration_level": self.duration_head(h),
+        }
+
+
+def _profile_consistency_loss(profile_head: RiskProfileHead | None, x_proj: torch.Tensor, risk_targets: torch.Tensor) -> torch.Tensor:
+    if profile_head is None or risk_targets.shape[1] < 9:
+        return x_proj.new_tensor(0.0)
+    logits = profile_head(x_proj)
+    target_cum = risk_targets[:, 6].long().clamp(0, 3)
+    target_ramp = risk_targets[:, 7].long().clamp(0, 3)
+    target_duration = risk_targets[:, 8].long().clamp(0, 3)
+    return (
+        F.cross_entropy(logits["cum_level"], target_cum)
+        + F.cross_entropy(logits["ramp_level"], target_ramp)
+        + F.cross_entropy(logits["duration_level"], target_duration)
+    )
+
+
 def _build_train_sampler(cond_train: pd.DataFrame, cfg: TrainConfig) -> tuple[WeightedRandomSampler | None, dict]:
     mode = cfg.sampler_mode.strip().lower()
     if mode in {"none", ""}:
@@ -304,8 +378,31 @@ def _build_train_sampler(cond_train: pd.DataFrame, cfg: TrainConfig) -> tuple[We
             norm_tail = ((tail - min_v) / (max_v - min_v + 1e-6)).to_numpy(dtype=np.float32)
         weights_np = 1.0 + float(cfg.tail_sampler_alpha) * norm_tail
         config = {"tail_sampler_alpha": float(cfg.tail_sampler_alpha)}
+    elif mode == "risk_profile_balanced":
+        # risk_profile_balanced 侧重高累计缺额和高爬坡样本，同时抑制高 cum_level 下 duration=3 的过度集中。
+        cum = pd.to_numeric(cond_train["cum_level"], errors="coerce").fillna(0).clip(0, 3).to_numpy(dtype=np.float32) if "cum_level" in cond_train.columns else np.zeros((len(cond_train),), dtype=np.float32)
+        ramp = pd.to_numeric(cond_train["ramp_level"], errors="coerce").fillna(0).clip(0, 3).to_numpy(dtype=np.float32) if "ramp_level" in cond_train.columns else np.zeros((len(cond_train),), dtype=np.float32)
+        dur = pd.to_numeric(cond_train["duration_level"], errors="coerce").fillna(0).clip(0, 3).to_numpy(dtype=np.float32) if "duration_level" in cond_train.columns else np.zeros((len(cond_train),), dtype=np.float32)
+        weights_np = 1.0 + float(cfg.risk_profile_cum_alpha) * cum + float(cfg.risk_profile_ramp_alpha) * ramp
+        if cfg.risk_profile_duration_balance:
+            for level in range(4):
+                group = cum == float(level)
+                if group.sum() <= 1:
+                    continue
+                dur3 = group & (dur >= 3.0)
+                ratio = float(dur3.sum() / max(group.sum(), 1))
+                if ratio > 0.35:
+                    weights_np[dur3] *= max(0.5, 0.35 / (ratio + 1e-6))
+        config = {
+            "risk_profile_cum_alpha": float(cfg.risk_profile_cum_alpha),
+            "risk_profile_ramp_alpha": float(cfg.risk_profile_ramp_alpha),
+            "risk_profile_duration_balance": bool(cfg.risk_profile_duration_balance),
+            "cum_level_counts": {str(i): int((cum == i).sum()) for i in range(4)},
+            "ramp_level_counts": {str(i): int((ramp == i).sum()) for i in range(4)},
+            "duration_level_counts": {str(i): int((dur == i).sum()) for i in range(4)},
+        }
     else:
-        raise ValueError("sampler_mode must be one of {'none', 'severity', 'tail_score'}.")
+        raise ValueError("sampler_mode must be one of {'none', 'severity', 'tail_score', 'risk_profile_balanced'}.")
 
     weights_np = np.asarray(weights_np, dtype=np.float32)
     weights_np = np.clip(weights_np, 1e-6, None)
@@ -362,6 +459,7 @@ def _forward_loss(
     cfg: TrainConfig,
     stage: str,
     train_mode: bool,
+    profile_head: RiskProfileHead | None = None,
 ) -> dict[str, torch.Tensor]:
     if len(batch) == 7:
         x, bg_cond, proc_cond, risk_cond, risk_targets, day_mask, event_mask = batch
@@ -378,6 +476,10 @@ def _forward_loss(
 
     if train_mode:
         bg_in, proc_in, risk_in = condition_dropout(bg_cond, proc_cond, risk_cond, cfg.cond_dropout)
+        if cfg.use_mask_condition and cfg.mask_condition_dropout > 0 and risk_in.shape[1] >= cfg.mask_condition_dim + 3:
+            keep_mask = (torch.rand(risk_in.size(0), device=device) > float(cfg.mask_condition_dropout)).float().view(-1, 1)
+            risk_in = risk_in.clone()
+            risk_in[:, -int(cfg.mask_condition_dim):] *= keep_mask
     else:
         bg_in, proc_in, risk_in = bg_cond, proc_cond, risk_cond
 
@@ -421,7 +523,8 @@ def _forward_loss(
     net_pred = x_proj[:, 0, :] - x_proj[:, 1, :] - x_proj[:, 2, :]
     net_true = x_true[:, 0, :] - x_true[:, 1, :] - x_true[:, 2, :]
     tau_t = risk_targets[:, 3].view(-1, 1)
-    exceed_prob_pred = torch.sigmoid((net_pred - tau_t) * cfg.duration_temp)
+    mask_temp = max(float(cfg.mask_temperature), 1e-6)
+    exceed_prob_pred = torch.sigmoid((net_pred - tau_t) / mask_temp)
     exceed_true = (net_true > tau_t).to(dtype=x_proj.dtype)
     exceed_mask_loss = F.binary_cross_entropy(exceed_prob_pred.clamp(1e-5, 1.0 - 1e-5), exceed_true)
     tail_dist_loss = topk_tail_distribution_loss_torch(
@@ -477,12 +580,14 @@ def _forward_loss(
         highrisk_mask=highrisk_mask,
         highrisk_only=bool(cfg.shape_highrisk_only),
     )
+    profile_loss = _profile_consistency_loss(profile_head, x_proj, risk_targets)
     total_loss = (
         eps_loss
         + sw["lambda_tail"] * tail_loss
         + sw["lambda_risk"] * weighted_risk_loss
         + sw["lambda_tail_dist"] * tail_dist_loss
         + sw["lambda_core_risk"] * core_risk_loss
+        + sw["lambda_profile"] * profile_loss
         + sw["lambda_delta_net"] * delta_net_loss
         + sw["lambda_ramp_topk"] * ramp_topk_loss
         + sw["lambda_shape_moment"] * shape_moment_loss
@@ -507,6 +612,7 @@ def _forward_loss(
         "core_cum_loss": core_cum_loss,
         "core_ramp_loss": core_ramp_loss,
         "core_dur_loss": core_dur_loss,
+        "profile_loss": profile_loss,
         "delta_net_loss": delta_net_loss,
         "ramp_topk_loss": ramp_topk_loss,
         "shape_moment_loss": shape_moment_loss,
@@ -528,13 +634,14 @@ def evaluate(
     risk_norm: dict[str, torch.Tensor],
     cfg: TrainConfig,
     stage: str,
+    profile_head: RiskProfileHead | None = None,
 ) -> dict[str, float]:
     stats: dict[str, float] = {}
     count = 0
     model.eval()
     with torch.no_grad():
         for batch in loader:
-            out = _forward_loss(model, scheduler, batch, device, x_mean_t, x_std_t, risk_norm, cfg, stage, train_mode=False)
+            out = _forward_loss(model, scheduler, batch, device, x_mean_t, x_std_t, risk_norm, cfg, stage, train_mode=False, profile_head=profile_head)
             bs = batch[0].size(0)
             count += bs
             for key, value in out.items():
@@ -705,6 +812,8 @@ def _make_pretrain_dataset(
         daylight_start_hour=cfg.daylight_start_hour,
         daylight_end_hour=cfg.daylight_end_hour,
         event_mask=None,
+        use_risk_profile_condition=cfg.use_risk_profile_condition,
+        use_mask_condition=cfg.use_mask_condition,
     )
 
 
@@ -755,6 +864,8 @@ def train_model(cfg: TrainConfig) -> dict:
         daylight_start_hour=cfg.daylight_start_hour,
         daylight_end_hour=cfg.daylight_end_hour,
         event_mask=train_event_mask,
+        use_risk_profile_condition=cfg.use_risk_profile_condition,
+        use_mask_condition=cfg.use_mask_condition,
     )
     val_ds = ConditionedWindowDataset(
         x_val_norm,
@@ -767,6 +878,8 @@ def train_model(cfg: TrainConfig) -> dict:
         daylight_start_hour=cfg.daylight_start_hour,
         daylight_end_hour=cfg.daylight_end_hour,
         event_mask=val_event_mask,
+        use_risk_profile_condition=cfg.use_risk_profile_condition,
+        use_mask_condition=cfg.use_mask_condition,
     )
 
     train_sampler, sampler_summary = _build_train_sampler(cond_train, cfg)
@@ -819,6 +932,7 @@ def train_model(cfg: TrainConfig) -> dict:
     ema_model.load_state_dict(model.state_dict())
     ema = EMA(model, cfg.ema_decay)
     scheduler = DiffusionScheduler(cfg.diffusion_steps, cfg.beta_start, cfg.beta_end, device=device).to(device)
+    profile_head = RiskProfileHead(in_channels=cfg.in_channels).to(device) if (cfg.use_profile_loss and cfg.lambda_profile > 0) else None
 
     pretrain_summary: dict | None = None
     frozen_blocks: list[str] = []
@@ -885,6 +999,7 @@ def train_model(cfg: TrainConfig) -> dict:
                     cfg,
                     "stage0_pretrain",
                     train_mode=True,
+                    profile_head=None,
                 )
                 pretrain_optimizer.zero_grad()
                 out["total_loss"].backward()
@@ -907,6 +1022,7 @@ def train_model(cfg: TrainConfig) -> dict:
                 risk_norm_t,
                 cfg,
                 "stage0_pretrain",
+                profile_head=None,
             )
             val_stats = {f"val_{key}": value for key, value in val_stats_raw.items()}
             row = {"epoch": pre_epoch, "stage": "stage0_pretrain"}
@@ -979,7 +1095,10 @@ def train_model(cfg: TrainConfig) -> dict:
         if frozen_blocks:
             warnings.append("freeze_after_pretrain enabled; frozen blocks: " + ", ".join(frozen_blocks))
 
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    trainable_params = list(p for p in model.parameters() if p.requires_grad)
+    if profile_head is not None:
+        trainable_params.extend(profile_head.parameters())
+    optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=cfg.weight_decay)
     ema_model.load_state_dict(model.state_dict())
     ema = EMA(model, cfg.ema_decay)
 
@@ -997,14 +1116,16 @@ def train_model(cfg: TrainConfig) -> dict:
     for epoch in range(1, total_epochs + 1):
         stage = stage_name(epoch, cfg)
         model.train()
+        if profile_head is not None:
+            profile_head.train()
         epoch_stats: dict[str, float] = {}
         count = 0
 
         for batch in train_loader:
-            out = _forward_loss(model, scheduler, batch, device, x_mean_t, x_std_t, risk_norm_t, cfg, stage, train_mode=True)
+            out = _forward_loss(model, scheduler, batch, device, x_mean_t, x_std_t, risk_norm_t, cfg, stage, train_mode=True, profile_head=profile_head)
             optimizer.zero_grad()
             out["total_loss"].backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
             ema.update(model)
 
@@ -1015,7 +1136,9 @@ def train_model(cfg: TrainConfig) -> dict:
 
         train_stats = {f"train_{key}": value / max(count, 1) for key, value in epoch_stats.items()}
         ema.copy_to(ema_model)
-        val_stats_raw = evaluate(ema_model, scheduler, val_loader, device, x_mean_t, x_std_t, risk_norm_t, cfg, stage)
+        if profile_head is not None:
+            profile_head.eval()
+        val_stats_raw = evaluate(ema_model, scheduler, val_loader, device, x_mean_t, x_std_t, risk_norm_t, cfg, stage, profile_head=profile_head)
         val_stats = {f"val_{key}": value for key, value in val_stats_raw.items()}
 
         row = {"epoch": epoch, "stage": stage}
@@ -1199,8 +1322,27 @@ def train_model(cfg: TrainConfig) -> dict:
             "lambda_shape_stage2": cfg.lambda_shape_stage2,
             "lambda_shape_stage3": cfg.lambda_shape_stage3,
             "lambda_duration_over_stage3": cfg.lambda_duration_over_stage3,
-            "lambda_exceed_mask_stage3": cfg.lambda_exceed_mask_stage3,
-            "lambda_recon": cfg.lambda_recon,
+        "lambda_exceed_mask_stage3": cfg.lambda_exceed_mask_stage3,
+        "use_risk_profile_condition": bool(cfg.use_risk_profile_condition),
+        "risk_profile_embed_dim": int(cfg.risk_profile_embed_dim),
+        "risk_profile_cum_alpha": float(cfg.risk_profile_cum_alpha),
+        "risk_profile_ramp_alpha": float(cfg.risk_profile_ramp_alpha),
+        "risk_profile_duration_balance": bool(cfg.risk_profile_duration_balance),
+        "use_profile_loss": bool(cfg.use_profile_loss),
+        "lambda_profile": float(cfg.lambda_profile),
+        "use_mask_prior": bool(cfg.use_mask_prior),
+        "lambda_mask_prior": float(cfg.lambda_mask_prior),
+        "use_mask_condition": bool(cfg.use_mask_condition),
+        "mask_condition_dropout": float(cfg.mask_condition_dropout),
+        "mask_condition_dim": int(cfg.mask_condition_dim),
+        "use_mask_consistency_loss": bool(cfg.use_mask_consistency_loss),
+        "lambda_mask_consistency": float(cfg.lambda_mask_consistency),
+        "mask_temperature": float(cfg.mask_temperature),
+        "risk_guidance_mode": cfg.risk_guidance_mode,
+        "risk_guidance_scale": float(cfg.risk_guidance_scale),
+        "risk_guidance_start_step_ratio": float(cfg.risk_guidance_start_step_ratio),
+        "risk_guidance_interval": int(cfg.risk_guidance_interval),
+        "lambda_recon": cfg.lambda_recon,
             "lambda_physics": cfg.lambda_physics,
             "lambda_resource": cfg.lambda_resource,
         },
@@ -1237,7 +1379,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--lambda-recon", type=float, default=0.05)
     parser.add_argument("--lambda-physics", type=float, default=0.02)
     parser.add_argument("--lambda-resource", type=float, default=0.02)
-    parser.add_argument("--sampler-mode", type=str, default="none", choices=["none", "severity", "tail_score"])
+    parser.add_argument("--sampler-mode", type=str, default="none", choices=["none", "severity", "tail_score", "risk_profile_balanced"])
     parser.add_argument("--severity-sample-weights", type=str, default="0:1.0,1:1.5,2:2.5,3:3.5")
     parser.add_argument("--tail-sampler-alpha", type=float, default=0.5)
     parser.add_argument("--tail-weight-mode", type=str, default="relu", choices=["relu", "sigmoid", "clipped_relu"])
@@ -1260,6 +1402,25 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--shape-highrisk-only", action=argparse.BooleanOptionalAction, default=True, help="是否仅在 highrisk 样本上计算形态锚定损失。")
     parser.add_argument("--lambda-duration-over-stage3", type=float, default=0.0, help="Stage 3 持续失衡时长过高的单边惩罚权重，用于压低生成样本系统性 duration 偏长。")
     parser.add_argument("--lambda-exceed-mask-stage3", type=float, default=0.0, help="Stage 3 逐时刻超阈值掩码损失权重，用于学习每个小时是否超过失衡阈值 tau。")
+    parser.add_argument("--use-risk-profile-condition", action="store_true", help="?? JRPD ?????????")
+    parser.add_argument("--risk-profile-embed-dim", type=int, default=8)
+    parser.add_argument("--risk-profile-cum-alpha", type=float, default=0.5)
+    parser.add_argument("--risk-profile-ramp-alpha", type=float, default=0.2)
+    parser.add_argument("--risk-profile-duration-balance", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-profile-loss", action="store_true", help="?? JRPD profile consistency auxiliary loss?")
+    parser.add_argument("--lambda-profile", type=float, default=0.0)
+    parser.add_argument("--use-mask-prior", action="store_true", help="???? MaskPrior-Diffusion?")
+    parser.add_argument("--lambda-mask-prior", type=float, default=0.0)
+    parser.add_argument("--use-mask-condition", action="store_true", help="? mask prior ???????????")
+    parser.add_argument("--mask-condition-dropout", type=float, default=0.2)
+    parser.add_argument("--mask-condition-dim", type=int, default=36)
+    parser.add_argument("--use-mask-consistency-loss", action="store_true")
+    parser.add_argument("--lambda-mask-consistency", type=float, default=0.0)
+    parser.add_argument("--mask-temperature", type=float, default=0.1)
+    parser.add_argument("--risk-guidance-mode", type=str, default="none", choices=["none", "classifier"])
+    parser.add_argument("--risk-guidance-scale", type=float, default=0.0)
+    parser.add_argument("--risk-guidance-start-step-ratio", type=float, default=0.5)
+    parser.add_argument("--risk-guidance-interval", type=int, default=5)
     parser.add_argument("--cond-dropout", type=float, default=0.10)
     parser.add_argument("--ema-decay", type=float, default=0.995)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
@@ -1324,6 +1485,25 @@ def parse_args() -> TrainConfig:
         shape_highrisk_only=args.shape_highrisk_only,
         lambda_duration_over_stage3=args.lambda_duration_over_stage3,
         lambda_exceed_mask_stage3=args.lambda_exceed_mask_stage3,
+        use_risk_profile_condition=args.use_risk_profile_condition,
+        risk_profile_embed_dim=args.risk_profile_embed_dim,
+        risk_profile_cum_alpha=args.risk_profile_cum_alpha,
+        risk_profile_ramp_alpha=args.risk_profile_ramp_alpha,
+        risk_profile_duration_balance=args.risk_profile_duration_balance,
+        use_profile_loss=args.use_profile_loss,
+        lambda_profile=args.lambda_profile,
+        use_mask_prior=args.use_mask_prior,
+        lambda_mask_prior=args.lambda_mask_prior,
+        use_mask_condition=args.use_mask_condition,
+        mask_condition_dropout=args.mask_condition_dropout,
+        mask_condition_dim=args.mask_condition_dim,
+        use_mask_consistency_loss=args.use_mask_consistency_loss,
+        lambda_mask_consistency=args.lambda_mask_consistency,
+        mask_temperature=args.mask_temperature,
+        risk_guidance_mode=args.risk_guidance_mode,
+        risk_guidance_scale=args.risk_guidance_scale,
+        risk_guidance_start_step_ratio=args.risk_guidance_start_step_ratio,
+        risk_guidance_interval=args.risk_guidance_interval,
         device=args.device,
         use_augmented_train=args.use_augmented_train,
         use_pretrain=args.use_pretrain,

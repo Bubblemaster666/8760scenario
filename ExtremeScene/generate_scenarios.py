@@ -20,6 +20,7 @@ from hierarchical_diffusion import (
     sample_sequences,
 )
 from risk_metrics import batch_hard_risk_metrics
+from risk_classifier import RiskClassifier1D
 
 
 @dataclass
@@ -39,6 +40,11 @@ class GenerationConfig:
     candidate_selection_mode: str = "none"
     candidate_risk_weights: str = "cum:1.0,ramp:0.3,duration:0.3"
     save_generated_candidates: bool = True
+    risk_guidance_mode: str = "none"
+    risk_classifier_path: Optional[str] = None
+    risk_guidance_scale: float = 0.0
+    risk_guidance_start_step_ratio: float = 0.5
+    risk_guidance_interval: int = 5
 
 
 def _checkpoint_name(checkpoint_type: str) -> str:
@@ -83,6 +89,14 @@ def _parse_candidate_risk_weights(text: str) -> dict[str, float]:
         key, value = item.split(":", 1)
         weights[key.strip()] = float(value)
     return weights
+
+
+def _condition_int_tensor(frame: pd.DataFrame, column: str, device: torch.device) -> torch.Tensor:
+    if column in frame.columns:
+        values = pd.to_numeric(frame[column], errors="coerce").fillna(0).clip(0, 3).to_numpy()
+    else:
+        values = np.zeros((len(frame),), dtype=np.int64)
+    return torch.as_tensor(values, dtype=torch.long, device=device)
 
 
 def _select_risk_guided_candidates(
@@ -184,6 +198,8 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
         ablation=str(ckpt["train_config"]["ablation"]),
         normalizers=cond_normalizers,
         expected_event_types=len(ckpt["condition_meta"]["background"]["event_onehot"]),
+        use_risk_profile_condition=bool(ckpt["train_config"].get("use_risk_profile_condition", False)),
+        use_mask_condition=bool(ckpt["train_config"].get("use_mask_condition", False)),
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -230,6 +246,37 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
     else:
         bg_sample, proc_sample, risk_sample, day_mask_sample = bg, proc, risk, day_mask
 
+    risk_guidance_classifier = None
+    risk_guidance_targets = None
+    classifier_x_mean = None
+    classifier_x_std = None
+    if cfg.risk_guidance_mode.strip().lower() == "classifier":
+        if not cfg.risk_classifier_path:
+            warnings.append("risk_guidance_mode=classifier but no risk_classifier_path was provided; guidance disabled.")
+        else:
+            clf_path = Path(cfg.risk_classifier_path)
+            if not clf_path.exists():
+                warnings.append(f"risk classifier checkpoint was not found: {clf_path}; guidance disabled.")
+            else:
+                clf_ckpt = torch.load(clf_path, map_location=device, weights_only=False)
+                risk_guidance_classifier = RiskClassifier1D(in_channels=int(ckpt["train_config"]["in_channels"])).to(device)
+                risk_guidance_classifier.load_state_dict(clf_ckpt["model_state"])
+                risk_guidance_classifier.eval()
+                classifier_x_mean = torch.as_tensor(clf_ckpt["x_mean"], dtype=torch.float32, device=device)
+                classifier_x_std = torch.as_tensor(clf_ckpt["x_std"], dtype=torch.float32, device=device)
+                risk_guidance_targets = {
+                    "cum_level": _condition_int_tensor(selected_cond, "cum_level", device),
+                    "ramp_level": _condition_int_tensor(selected_cond, "ramp_level", device),
+                    "duration_level": _condition_int_tensor(selected_cond, "duration_level", device),
+                    "severity_level": _condition_int_tensor(selected_cond, "severity_level", device),
+                }
+                if num_candidates > 1 and selection_mode == "risk_target":
+                    risk_guidance_targets = {key: value.repeat_interleave(num_candidates) for key, value in risk_guidance_targets.items()}
+
+    x_mean = np.asarray(ckpt["x_mean"], dtype=np.float32)
+    x_std = np.asarray(ckpt["x_std"], dtype=np.float32)
+    x_mean_t = torch.as_tensor(x_mean, dtype=torch.float32, device=device)
+    x_std_t = torch.as_tensor(x_std, dtype=torch.float32, device=device)
     gen_norm = sample_sequences(
         model=model,
         scheduler=scheduler,
@@ -239,9 +286,17 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
         shape=(bg_sample.shape[0], int(ckpt["train_config"]["in_channels"]), int(ckpt["seq_len"])),
         guidance_scale=guidance,
         device=device,
+        day_mask=day_mask_sample,
+        x_mean=x_mean_t,
+        x_std=x_std_t,
+        risk_guidance_classifier=risk_guidance_classifier,
+        risk_guidance_targets=risk_guidance_targets,
+        risk_guidance_scale=float(cfg.risk_guidance_scale),
+        risk_guidance_start_step_ratio=float(cfg.risk_guidance_start_step_ratio),
+        risk_guidance_interval=int(cfg.risk_guidance_interval),
+        classifier_x_mean=classifier_x_mean,
+        classifier_x_std=classifier_x_std,
     ).detach()
-    x_mean = np.asarray(ckpt["x_mean"], dtype=np.float32)
-    x_std = np.asarray(ckpt["x_std"], dtype=np.float32)
     gen_denorm = denormalize_x_np(gen_norm.cpu().numpy(), x_mean, x_std).astype(np.float32)
     gen_proj_all = apply_physical_projection(torch.from_numpy(gen_denorm).to(device), day_mask_sample).cpu().numpy().astype(np.float32)
     candidate_summary_rows = []
@@ -294,6 +349,11 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
         "candidate_risk_weights": candidate_weights,
         "generated_candidates_saved": bool(num_candidates > 1 and selection_mode == "risk_target" and cfg.save_generated_candidates),
         "candidate_selection_mean_score": float(np.mean([row["selected_score"] for row in candidate_summary_rows])) if candidate_summary_rows else None,
+        "risk_guidance_mode": cfg.risk_guidance_mode,
+        "risk_classifier_path": cfg.risk_classifier_path,
+        "risk_guidance_scale": float(cfg.risk_guidance_scale),
+        "risk_guidance_start_step_ratio": float(cfg.risk_guidance_start_step_ratio),
+        "risk_guidance_interval": int(cfg.risk_guidance_interval),
         "requested_duration_hours": cfg.duration_hours,
         "actual_condition_duration_hours": selected_cond["duration_hours"].astype(float).tolist() if "duration_hours" in selected_cond else [],
         "duration_generation_mode": duration_mode,
@@ -330,6 +390,11 @@ def parse_args() -> GenerationConfig:
     parser.add_argument("--candidate-selection-mode", type=str, default="none", choices=["none", "risk_target"])
     parser.add_argument("--candidate-risk-weights", type=str, default="cum:1.0,ramp:0.3,duration:0.3")
     parser.add_argument("--save-generated-candidates", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--risk-guidance-mode", type=str, default="none", choices=["none", "classifier"])
+    parser.add_argument("--risk-classifier-path", type=str, default=None)
+    parser.add_argument("--risk-guidance-scale", type=float, default=0.0)
+    parser.add_argument("--risk-guidance-start-step-ratio", type=float, default=0.5)
+    parser.add_argument("--risk-guidance-interval", type=int, default=5)
     args = parser.parse_args()
     return GenerationConfig(
         checkpoint=args.checkpoint,
@@ -347,6 +412,11 @@ def parse_args() -> GenerationConfig:
         candidate_selection_mode=args.candidate_selection_mode,
         candidate_risk_weights=args.candidate_risk_weights,
         save_generated_candidates=args.save_generated_candidates,
+        risk_guidance_mode=args.risk_guidance_mode,
+        risk_classifier_path=args.risk_classifier_path,
+        risk_guidance_scale=args.risk_guidance_scale,
+        risk_guidance_start_step_ratio=args.risk_guidance_start_step_ratio,
+        risk_guidance_interval=args.risk_guidance_interval,
     )
 
 
