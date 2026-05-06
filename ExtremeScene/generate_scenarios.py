@@ -200,6 +200,8 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
         expected_event_types=len(ckpt["condition_meta"]["background"]["event_onehot"]),
         use_risk_profile_condition=bool(ckpt["train_config"].get("use_risk_profile_condition", False)),
         use_mask_condition=bool(ckpt["train_config"].get("use_mask_condition", False)),
+        use_ramp_event_condition=bool(ckpt["train_config"].get("use_ramp_event_condition", False)),
+        ramp_event_condition_scale=float(ckpt["train_config"].get("ramp_event_condition_scale", 1.0)),
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

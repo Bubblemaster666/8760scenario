@@ -134,6 +134,14 @@ class TrainConfig:
     risk_guidance_start_step_ratio: float = 0.5
     risk_guidance_interval: int = 5
 
+    # Ramp Event Condition: ???????????????????
+    use_ramp_event_condition: bool = False
+    ramp_source_embed_dim: int = 4
+    ramp_event_condition_scale: float = 1.0
+    use_ramp_event_loss: bool = False
+    lambda_ramp_event: float = 0.0
+    ramp_peak_softmax_temp: float = 0.2
+
     duration_temp: float = 12.0
     delta_t_hours: float = 1.0
     daylight_start_hour: int = 6
@@ -244,6 +252,7 @@ def stage_weights(stage: str, cfg: TrainConfig) -> dict[str, float]:
         "lambda_duration_over": 0.0,
         "lambda_exceed_mask": 0.0,
         "lambda_profile": 0.0,
+        "lambda_ramp_event": 0.0,
         "lambda_recon": cfg.lambda_recon,
         "lambda_physics": cfg.lambda_physics,
         "lambda_resource": 0.0,
@@ -267,6 +276,7 @@ def stage_weights(stage: str, cfg: TrainConfig) -> dict[str, float]:
         if cfg.use_mask_consistency_loss:
             weights["lambda_exceed_mask"] = max(weights["lambda_exceed_mask"], cfg.lambda_mask_consistency)
         weights["lambda_profile"] = cfg.lambda_profile if cfg.use_profile_loss else 0.0
+        weights["lambda_ramp_event"] = cfg.lambda_ramp_event if cfg.use_ramp_event_loss else 0.0
     return weights
 
 
@@ -356,6 +366,47 @@ def _profile_consistency_loss(profile_head: RiskProfileHead | None, x_proj: torc
         + F.cross_entropy(logits["ramp_level"], target_ramp)
         + F.cross_entropy(logits["duration_level"], target_duration)
     )
+
+
+def _ramp_event_losses(
+    x_proj: torch.Tensor,
+    x_true: torch.Tensor,
+    risk_targets: torch.Tensor,
+    risk_norm: dict[str, torch.Tensor],
+    cfg: TrainConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Differentiable ramp-event consistency losses.
+
+    net_load is load - wind_power - solar_power. delta_net is the adjacent-hour
+    net-load change sequence and describes the ramp process, not just the max.
+    """
+
+    if risk_targets.shape[1] < 12:
+        zero = x_proj.new_tensor(0.0)
+        return zero, zero, zero, zero
+    net_pred = x_proj[:, 0, :] - x_proj[:, 1, :] - x_proj[:, 2, :]
+    net_true = x_true[:, 0, :] - x_true[:, 1, :] - x_true[:, 2, :]
+    delta_pred = net_pred[:, 1:] - net_pred[:, :-1]
+    delta_true = net_true[:, 1:] - net_true[:, :-1]
+    ramp_std = risk_norm["ramp_std"].clamp(min=1e-6)
+    delta_seq_loss = F.smooth_l1_loss(delta_pred / ramp_std, delta_true / ramp_std)
+
+    temp = max(float(cfg.ramp_peak_softmax_temp), 1e-6)
+    positions = torch.arange(delta_pred.size(1), device=x_proj.device, dtype=x_proj.dtype)
+    weights = torch.softmax(delta_pred / temp, dim=1)
+    soft_peak_time = (weights * positions.view(1, -1)).sum(dim=1)
+    true_peak_time = risk_targets[:, 10].clamp(0, max(delta_pred.size(1) - 1, 0))
+    peak_time_loss = F.smooth_l1_loss(
+        soft_peak_time / max(float(delta_pred.size(1) - 1), 1.0),
+        true_peak_time / max(float(delta_pred.size(1) - 1), 1.0),
+    )
+
+    peak_value_pred = delta_pred.max(dim=1).values
+    peak_value_true = risk_targets[:, 11]
+    peak_value_loss = F.smooth_l1_loss(peak_value_pred / ramp_std, peak_value_true / ramp_std)
+    # L_ramp_event = 0.5*L_delta_net_seq + 0.3*L_peak_time + 0.5*L_peak_value.
+    total = 0.5 * delta_seq_loss + 0.3 * peak_time_loss + 0.5 * peak_value_loss
+    return total, delta_seq_loss, peak_time_loss, peak_value_loss
 
 
 def _build_train_sampler(cond_train: pd.DataFrame, cfg: TrainConfig) -> tuple[WeightedRandomSampler | None, dict]:
@@ -581,6 +632,13 @@ def _forward_loss(
         highrisk_only=bool(cfg.shape_highrisk_only),
     )
     profile_loss = _profile_consistency_loss(profile_head, x_proj, risk_targets)
+    ramp_event_loss, ramp_event_delta_loss, ramp_event_peak_time_loss, ramp_event_peak_value_loss = _ramp_event_losses(
+        x_proj=x_proj,
+        x_true=x_true,
+        risk_targets=risk_targets,
+        risk_norm=risk_norm,
+        cfg=cfg,
+    )
     total_loss = (
         eps_loss
         + sw["lambda_tail"] * tail_loss
@@ -588,6 +646,7 @@ def _forward_loss(
         + sw["lambda_tail_dist"] * tail_dist_loss
         + sw["lambda_core_risk"] * core_risk_loss
         + sw["lambda_profile"] * profile_loss
+        + sw["lambda_ramp_event"] * ramp_event_loss
         + sw["lambda_delta_net"] * delta_net_loss
         + sw["lambda_ramp_topk"] * ramp_topk_loss
         + sw["lambda_shape_moment"] * shape_moment_loss
@@ -613,6 +672,10 @@ def _forward_loss(
         "core_ramp_loss": core_ramp_loss,
         "core_dur_loss": core_dur_loss,
         "profile_loss": profile_loss,
+        "ramp_event_loss": ramp_event_loss,
+        "ramp_event_delta_loss": ramp_event_delta_loss,
+        "ramp_event_peak_time_loss": ramp_event_peak_time_loss,
+        "ramp_event_peak_value_loss": ramp_event_peak_value_loss,
         "delta_net_loss": delta_net_loss,
         "ramp_topk_loss": ramp_topk_loss,
         "shape_moment_loss": shape_moment_loss,
@@ -814,6 +877,8 @@ def _make_pretrain_dataset(
         event_mask=None,
         use_risk_profile_condition=cfg.use_risk_profile_condition,
         use_mask_condition=cfg.use_mask_condition,
+        use_ramp_event_condition=cfg.use_ramp_event_condition,
+        ramp_event_condition_scale=cfg.ramp_event_condition_scale,
     )
 
 
@@ -866,6 +931,8 @@ def train_model(cfg: TrainConfig) -> dict:
         event_mask=train_event_mask,
         use_risk_profile_condition=cfg.use_risk_profile_condition,
         use_mask_condition=cfg.use_mask_condition,
+        use_ramp_event_condition=cfg.use_ramp_event_condition,
+        ramp_event_condition_scale=cfg.ramp_event_condition_scale,
     )
     val_ds = ConditionedWindowDataset(
         x_val_norm,
@@ -880,6 +947,8 @@ def train_model(cfg: TrainConfig) -> dict:
         event_mask=val_event_mask,
         use_risk_profile_condition=cfg.use_risk_profile_condition,
         use_mask_condition=cfg.use_mask_condition,
+        use_ramp_event_condition=cfg.use_ramp_event_condition,
+        ramp_event_condition_scale=cfg.ramp_event_condition_scale,
     )
 
     train_sampler, sampler_summary = _build_train_sampler(cond_train, cfg)
@@ -1342,6 +1411,12 @@ def train_model(cfg: TrainConfig) -> dict:
         "risk_guidance_scale": float(cfg.risk_guidance_scale),
         "risk_guidance_start_step_ratio": float(cfg.risk_guidance_start_step_ratio),
         "risk_guidance_interval": int(cfg.risk_guidance_interval),
+        "use_ramp_event_condition": bool(cfg.use_ramp_event_condition),
+        "ramp_source_embed_dim": int(cfg.ramp_source_embed_dim),
+        "ramp_event_condition_scale": float(cfg.ramp_event_condition_scale),
+        "use_ramp_event_loss": bool(cfg.use_ramp_event_loss),
+        "lambda_ramp_event": float(cfg.lambda_ramp_event),
+        "ramp_peak_softmax_temp": float(cfg.ramp_peak_softmax_temp),
         "lambda_recon": cfg.lambda_recon,
             "lambda_physics": cfg.lambda_physics,
             "lambda_resource": cfg.lambda_resource,
@@ -1421,6 +1496,12 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--risk-guidance-scale", type=float, default=0.0)
     parser.add_argument("--risk-guidance-start-step-ratio", type=float, default=0.5)
     parser.add_argument("--risk-guidance-interval", type=int, default=5)
+    parser.add_argument("--use-ramp-event-condition", action="store_true", help="?? ramp event process condition?")
+    parser.add_argument("--ramp-source-embed-dim", type=int, default=4)
+    parser.add_argument("--ramp-event-condition-scale", type=float, default=1.0)
+    parser.add_argument("--use-ramp-event-loss", action="store_true", help="?? ramp event consistency loss?")
+    parser.add_argument("--lambda-ramp-event", type=float, default=0.0)
+    parser.add_argument("--ramp-peak-softmax-temp", type=float, default=0.2)
     parser.add_argument("--cond-dropout", type=float, default=0.10)
     parser.add_argument("--ema-decay", type=float, default=0.995)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
@@ -1504,6 +1585,12 @@ def parse_args() -> TrainConfig:
         risk_guidance_scale=args.risk_guidance_scale,
         risk_guidance_start_step_ratio=args.risk_guidance_start_step_ratio,
         risk_guidance_interval=args.risk_guidance_interval,
+        use_ramp_event_condition=args.use_ramp_event_condition,
+        ramp_source_embed_dim=args.ramp_source_embed_dim,
+        ramp_event_condition_scale=args.ramp_event_condition_scale,
+        use_ramp_event_loss=args.use_ramp_event_loss,
+        lambda_ramp_event=args.lambda_ramp_event,
+        ramp_peak_softmax_temp=args.ramp_peak_softmax_temp,
         device=args.device,
         use_augmented_train=args.use_augmented_train,
         use_pretrain=args.use_pretrain,

@@ -64,6 +64,8 @@ def build_condition_bundle(
     daylight_end_hour: int = 18,
     use_risk_profile_condition: bool = False,
     use_mask_condition: bool = False,
+    use_ramp_event_condition: bool = False,
+    ramp_event_condition_scale: float = 1.0,
 ) -> tuple[dict[str, np.ndarray], dict]:
     cond_df = cond_df.reset_index(drop=True).copy()
     meta_df = meta_df.reset_index(drop=True).copy()
@@ -98,7 +100,40 @@ def build_condition_bundle(
     severity = (cond_df["severity_level"].astype(float).to_numpy(dtype=np.float32) / 3.0)[:, None]
 
     bg = np.concatenate([event_onehot, month_sin, month_cos, season_onehot], axis=1).astype(np.float32)
-    proc = np.concatenate([low_wind, low_irr, duration_z, start_hour_sin, start_hour_cos], axis=1).astype(np.float32)
+    proc_parts = [low_wind, low_irr, duration_z, start_hour_sin, start_hour_cos]
+    proc_layout: dict[str, list[int]] = {
+        "low_wind_flag": [0],
+        "low_irradiance_flag": [1],
+        "duration_hours_zscore": [2],
+        "start_hour_sin": [3],
+        "start_hour_cos": [4],
+    }
+    if use_ramp_event_condition:
+        scale = float(ramp_event_condition_scale)
+        offset = sum(part.shape[1] for part in proc_parts)
+        peak_sin_values = pd.to_numeric(cond_df["ramp_peak_time_sin"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32) if "ramp_peak_time_sin" in cond_df.columns else np.zeros((len(cond_df),), dtype=np.float32)
+        peak_cos_values = pd.to_numeric(cond_df["ramp_peak_time_cos"], errors="coerce").fillna(1.0).to_numpy(dtype=np.float32) if "ramp_peak_time_cos" in cond_df.columns else np.ones((len(cond_df),), dtype=np.float32)
+        ramp_width_values = pd.to_numeric(cond_df["ramp_width"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32) if "ramp_width" in cond_df.columns else np.zeros((len(cond_df),), dtype=np.float32)
+        peak_sin = peak_sin_values[:, None]
+        peak_cos = peak_cos_values[:, None]
+        ramp_width = ramp_width_values[:, None] / max(float(seq_len - 1), 1.0)
+        source = pd.to_numeric(cond_df["ramp_source_type"], errors="coerce").fillna(3).clip(0, 3).astype(int).to_numpy() if "ramp_source_type" in cond_df.columns else np.full((len(cond_df),), 3, dtype=np.int64)
+        ramp_source_onehot = np.eye(4, dtype=np.float32)[source]
+        ramp_level = pd.to_numeric(cond_df["ramp_level"], errors="coerce").fillna(0).clip(0, 3).astype(int).to_numpy() if "ramp_level" in cond_df.columns else np.zeros((len(cond_df),), dtype=np.int64)
+        ramp_level_onehot = np.eye(4, dtype=np.float32)[ramp_level]
+        # One-hot source/ramp-level plus the following Linear layer is equivalent to a small trainable embedding.
+        ramp_event = np.concatenate([peak_sin, peak_cos, ramp_width, ramp_source_onehot, ramp_level_onehot], axis=1).astype(np.float32) * scale
+        proc_parts.append(ramp_event)
+        proc_layout.update(
+            {
+                "ramp_peak_time_sin": [offset],
+                "ramp_peak_time_cos": [offset + 1],
+                "ramp_width_scaled": [offset + 2],
+                "ramp_source_type_onehot": list(range(offset + 3, offset + 7)),
+                "ramp_level_onehot": list(range(offset + 7, offset + 11)),
+            }
+        )
+    proc = np.concatenate(proc_parts, axis=1).astype(np.float32)
 
     risk_parts = [extreme_prob, tail_score_z, severity]
     risk_layout: dict[str, list[int]] = {
@@ -160,6 +195,8 @@ def build_condition_bundle(
     ].copy()
     for col in ["cum_level", "ramp_level", "duration_level", "risk_profile_id"]:
         risk_targets_df[col] = pd.to_numeric(cond_df[col], errors="coerce").fillna(0.0) if col in cond_df.columns else 0.0
+    for col in ["ramp_peak_time", "ramp_peak_value", "ramp_width", "ramp_source_type"]:
+        risk_targets_df[col] = pd.to_numeric(cond_df[col], errors="coerce").fillna(0.0) if col in cond_df.columns else 0.0
     risk_targets = risk_targets_df.to_numpy(dtype=np.float32)
 
     layout = {
@@ -169,13 +206,7 @@ def build_condition_bundle(
             "month_cos": [event_onehot.shape[1] + 1],
             "season_onehot": list(range(event_onehot.shape[1] + 2, bg.shape[1])),
         },
-        "process": {
-            "low_wind_flag": [0],
-            "low_irradiance_flag": [1],
-            "duration_hours_zscore": [2],
-            "start_hour_sin": [3],
-            "start_hour_cos": [4],
-        },
+        "process": proc_layout,
         "risk": risk_layout,
         "ablation": ablation,
         "normalizers": {
@@ -210,6 +241,8 @@ class ConditionedWindowDataset(Dataset):
         event_mask: Optional[np.ndarray] = None,
         use_risk_profile_condition: bool = False,
         use_mask_condition: bool = False,
+        use_ramp_event_condition: bool = False,
+        ramp_event_condition_scale: float = 1.0,
     ) -> None:
         if x.ndim != 3 or x.shape[1] != 3:
             raise ValueError("Expected X with shape [N, 3, T].")
@@ -228,6 +261,8 @@ class ConditionedWindowDataset(Dataset):
             daylight_end_hour=daylight_end_hour,
             use_risk_profile_condition=use_risk_profile_condition,
             use_mask_condition=use_mask_condition,
+            use_ramp_event_condition=use_ramp_event_condition,
+            ramp_event_condition_scale=ramp_event_condition_scale,
         )
         self.background = arrays["background"]
         self.process = arrays["process"]
