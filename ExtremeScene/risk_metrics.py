@@ -114,7 +114,22 @@ def hard_risk_metrics_from_frame(df: pd.DataFrame, cfg: RiskMetricConfig) -> tup
     return out, tau, delta_t_hours
 
 
-def batch_hard_risk_metrics(x: np.ndarray, tau: np.ndarray | float, delta_t_hours: float = 1.0) -> dict[str, np.ndarray]:
+def _parse_ramp_windows(multiscale_ramp_windows: str | Iterable[float] | None) -> list[float]:
+    if multiscale_ramp_windows is None:
+        return [1.0, 2.0, 3.0]
+    if isinstance(multiscale_ramp_windows, str):
+        return [float(item.strip()) for item in multiscale_ramp_windows.split(",") if item.strip()]
+    return [float(item) for item in multiscale_ramp_windows]
+
+
+def batch_hard_risk_metrics(
+    x: np.ndarray,
+    tau: np.ndarray | float,
+    delta_t_hours: float = 1.0,
+    ramp_metric_mode: str = "one_step",
+    ramp_window_hours: float = 1.0,
+    multiscale_ramp_windows: str | Iterable[float] | None = None,
+) -> dict[str, np.ndarray]:
     if x.ndim != 3 or x.shape[1] != 3:
         raise ValueError("Expected x with shape [N, 3, T].")
     tau_arr = np.asarray(tau, dtype=float)
@@ -123,22 +138,126 @@ def batch_hard_risk_metrics(x: np.ndarray, tau: np.ndarray | float, delta_t_hour
     net = x[:, 0, :] - x[:, 1, :] - x[:, 2, :]
     excess = np.maximum(0.0, net - tau_arr[:, None])
     cum = excess.sum(axis=1) * delta_t_hours
-    ramp = np.diff(net, axis=1, prepend=net[:, :1])
-    ramp_max = ramp.max(axis=1)
+    mode = str(ramp_metric_mode).strip().lower()
+    if mode in {"one_step", "window_1h"}:
+        ramp_max = compute_windowed_netload_ramp(x, delta_t_hours=delta_t_hours, ramp_window_hours=1.0, positive_only=True)
+    elif mode == "window_2h":
+        ramp_max = compute_windowed_netload_ramp(x, delta_t_hours=delta_t_hours, ramp_window_hours=2.0, positive_only=True)
+    elif mode == "window_3h":
+        ramp_max = compute_windowed_netload_ramp(x, delta_t_hours=delta_t_hours, ramp_window_hours=3.0, positive_only=True)
+    elif mode == "custom_window":
+        ramp_max = compute_windowed_netload_ramp(x, delta_t_hours=delta_t_hours, ramp_window_hours=float(ramp_window_hours), positive_only=True)
+    elif mode == "multiscale":
+        ramps = compute_multiscale_netload_ramp(x, delta_t_hours=delta_t_hours, ramp_window_hours_list=_parse_ramp_windows(multiscale_ramp_windows), aggregation="max")
+        ramp_max = ramps["netload_ramp_multiscale"]
+    else:
+        raise ValueError("ramp_metric_mode must be one of one_step/window_1h/window_2h/window_3h/custom_window/multiscale.")
     duration = (net > tau_arr[:, None]).sum(axis=1) * delta_t_hours
     return {"cum_deficit": cum.astype(float), "netload_ramp_max": ramp_max.astype(float), "imbalance_duration": duration.astype(float)}
 
 
-def soft_risk_metrics_torch(x_denorm: torch.Tensor, tau: torch.Tensor, delta_t_hours: float = 1.0, duration_temp: float = 12.0) -> dict[str, torch.Tensor]:
+def compute_windowed_netload_ramp(
+    x: np.ndarray,
+    delta_t_hours: float,
+    ramp_window_hours: float,
+    positive_only: bool = True,
+) -> np.ndarray | float:
+    """Compute maximum net-load ramp over a configurable time window.
+
+    x can be [N, 3, T] or [3, T], with channels load, wind_power, solar_power.
+    net_load is load - wind_power - solar_power. ramp_window_hours is the
+    ramp time window. windowed_ramp_max is the maximum net-load rise within the
+    selected window and represents short-to-mid-term regulation pressure.
+    """
+
+    arr = np.asarray(x, dtype=float)
+    single = False
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+        single = True
+    if arr.ndim != 3 or arr.shape[1] != 3:
+        raise ValueError("Expected x with shape [N, 3, T] or [3, T].")
+    if delta_t_hours <= 0:
+        raise ValueError("delta_t_hours must be positive.")
+    window_steps = max(1, int(round(float(ramp_window_hours) / float(delta_t_hours))))
+    t_len = arr.shape[2]
+    if window_steps >= t_len:
+        out = np.full((arr.shape[0],), np.nan, dtype=float)
+        return float(out[0]) if single else out
+    net_load = arr[:, 0, :] - arr[:, 1, :] - arr[:, 2, :]
+    ramp = net_load[:, window_steps:] - net_load[:, :-window_steps]
+    if positive_only:
+        ramp = np.maximum(ramp, 0.0)
+    out = np.nanmax(ramp, axis=1).astype(float)
+    return float(out[0]) if single else out
+
+
+def compute_multiscale_netload_ramp(
+    x: np.ndarray,
+    delta_t_hours: float,
+    ramp_window_hours_list: list[float] | tuple[float, ...] = (1.0, 2.0, 3.0),
+    aggregation: str = "max",
+) -> dict[str, np.ndarray]:
+    """Compute 1h/2h/3h and aggregated multiscale net-load ramp."""
+
+    ramps: dict[str, np.ndarray] = {}
+    stack = []
+    for window in ramp_window_hours_list:
+        values = np.asarray(compute_windowed_netload_ramp(x, delta_t_hours, window, positive_only=True), dtype=float)
+        key = f"netload_ramp_{int(window) if float(window).is_integer() else str(window).replace('.', 'p')}h"
+        ramps[key] = values
+        stack.append(values)
+    stacked = np.vstack(stack) if stack else np.empty((0,))
+    mode = aggregation.strip().lower()
+    if mode == "max":
+        multi = np.nanmax(stacked, axis=0)
+    elif mode == "mean":
+        multi = np.nanmean(stacked, axis=0)
+    else:
+        raise ValueError("aggregation must be 'max' or 'mean'.")
+    ramps["netload_ramp_multiscale"] = multi.astype(float)
+    return ramps
+
+
+def _soft_windowed_ramp_torch(net: torch.Tensor, window_steps: int, duration_temp: float) -> torch.Tensor:
+    if window_steps >= net.shape[1]:
+        return torch.zeros((net.size(0),), device=net.device, dtype=net.dtype)
+    ramp = F.relu(net[:, window_steps:] - net[:, :-window_steps])
+    if ramp.shape[1] == 0:
+        return torch.zeros((net.size(0),), device=net.device, dtype=net.dtype)
+    return torch.logsumexp(ramp * duration_temp, dim=1) / duration_temp
+
+
+def soft_risk_metrics_torch(
+    x_denorm: torch.Tensor,
+    tau: torch.Tensor,
+    delta_t_hours: float = 1.0,
+    duration_temp: float = 12.0,
+    ramp_metric_mode: str = "one_step",
+    ramp_window_hours: float = 1.0,
+    multiscale_ramp_windows: str | Iterable[float] | None = None,
+) -> dict[str, torch.Tensor]:
     net = x_denorm[:, 0, :] - x_denorm[:, 1, :] - x_denorm[:, 2, :]
     tau = tau.view(-1, 1)
     excess = F.softplus((net - tau) * duration_temp) / duration_temp
     cum = excess.sum(dim=1) * delta_t_hours
-    ramp = net[:, 1:] - net[:, :-1]
-    if ramp.shape[1] == 0:
-        ramp_max = torch.zeros((net.size(0),), device=net.device, dtype=net.dtype)
+    mode = str(ramp_metric_mode).strip().lower()
+    if mode in {"one_step", "window_1h"}:
+        ramp_max = _soft_windowed_ramp_torch(net, max(1, int(round(1.0 / float(delta_t_hours)))), duration_temp)
+    elif mode == "window_2h":
+        ramp_max = _soft_windowed_ramp_torch(net, max(1, int(round(2.0 / float(delta_t_hours)))), duration_temp)
+    elif mode == "window_3h":
+        ramp_max = _soft_windowed_ramp_torch(net, max(1, int(round(3.0 / float(delta_t_hours)))), duration_temp)
+    elif mode == "custom_window":
+        ramp_max = _soft_windowed_ramp_torch(net, max(1, int(round(float(ramp_window_hours) / float(delta_t_hours)))), duration_temp)
+    elif mode == "multiscale":
+        values = [
+            _soft_windowed_ramp_torch(net, max(1, int(round(float(hours) / float(delta_t_hours)))), duration_temp)
+            for hours in _parse_ramp_windows(multiscale_ramp_windows)
+        ]
+        ramp_max = torch.stack(values, dim=1).max(dim=1).values
     else:
-        ramp_max = torch.logsumexp(ramp * duration_temp, dim=1) / duration_temp
+        raise ValueError("ramp_metric_mode must be one of one_step/window_1h/window_2h/window_3h/custom_window/multiscale.")
     duration = torch.sigmoid((net - tau) * duration_temp).sum(dim=1) * delta_t_hours
     return cum, ramp_max, duration
 

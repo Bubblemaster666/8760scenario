@@ -28,6 +28,9 @@ class EvalConfig:
     model_name: str
     max_lag: int = 12
     event_mask: str | None = None
+    ramp_metric_mode: str = "one_step"
+    ramp_window_hours: float = 1.0
+    multiscale_ramp_windows: str = "1.0,2.0,3.0"
 
 
 EXTREME_MAIN_METRICS = [
@@ -155,7 +158,16 @@ def _batch_core_risk_metrics(x: np.ndarray, event_mask: np.ndarray, tau: np.ndar
         "imbalance_duration": np.asarray(duration, dtype=float),
     }
 
-def compute_metrics(real: np.ndarray, gen: np.ndarray, cond: pd.DataFrame, max_lag: int, event_mask: np.ndarray | None = None) -> dict[str, float | str]:
+def compute_metrics(
+    real: np.ndarray,
+    gen: np.ndarray,
+    cond: pd.DataFrame,
+    max_lag: int,
+    event_mask: np.ndarray | None = None,
+    ramp_metric_mode: str = "one_step",
+    ramp_window_hours: float = 1.0,
+    multiscale_ramp_windows: str = "1.0,2.0,3.0",
+) -> dict[str, float | str]:
     names = ["load", "wind_power", "solar_power"]
     metrics: dict[str, float] = {}
     wasserstein_scores = []
@@ -185,8 +197,22 @@ def compute_metrics(real: np.ndarray, gen: np.ndarray, cond: pd.DataFrame, max_l
 
     tau = cond["imbalance_tau"].astype(float).to_numpy() if "imbalance_tau" in cond.columns else np.zeros((len(cond),), dtype=float)
     delta_t = float(cond["delta_t_hours"].astype(float).iloc[0]) if "delta_t_hours" in cond.columns else 1.0
-    risk_real = batch_hard_risk_metrics(real, tau=tau, delta_t_hours=delta_t)
-    risk_gen = batch_hard_risk_metrics(gen, tau=tau, delta_t_hours=delta_t)
+    risk_real = batch_hard_risk_metrics(
+        real,
+        tau=tau,
+        delta_t_hours=delta_t,
+        ramp_metric_mode=ramp_metric_mode,
+        ramp_window_hours=ramp_window_hours,
+        multiscale_ramp_windows=multiscale_ramp_windows,
+    )
+    risk_gen = batch_hard_risk_metrics(
+        gen,
+        tau=tau,
+        delta_t_hours=delta_t,
+        ramp_metric_mode=ramp_metric_mode,
+        ramp_window_hours=ramp_window_hours,
+        multiscale_ramp_windows=multiscale_ramp_windows,
+    )
 
     risk_rows = []
     for key in ["cum_deficit", "netload_ramp_max", "imbalance_duration"]:
@@ -224,6 +250,9 @@ def compute_highrisk_metrics(
     cond: pd.DataFrame,
     max_lag: int,
     event_mask: np.ndarray | None = None,
+    ramp_metric_mode: str = "one_step",
+    ramp_window_hours: float = 1.0,
+    multiscale_ramp_windows: str = "1.0,2.0,3.0",
 ) -> tuple[dict[str, float], str | None]:
     """Compute high-risk conditional metrics on samples with severity_level >= 2."""
     out = {target: float("nan") for target in HIGHRISK_METRIC_MAP.values()}
@@ -239,6 +268,9 @@ def compute_highrisk_metrics(
         cond.iloc[idx].reset_index(drop=True),
         max_lag=max_lag,
         event_mask=None if event_mask is None else event_mask[idx],
+        ramp_metric_mode=ramp_metric_mode,
+        ramp_window_hours=ramp_window_hours,
+        multiscale_ramp_windows=multiscale_ramp_windows,
     )
     for source, target in HIGHRISK_METRIC_MAP.items():
         out[target] = float(sub_metrics.get(source, np.nan))
@@ -360,10 +392,28 @@ def evaluate_generation(cfg: EvalConfig) -> dict:
     warnings: list[str] = []
     if event_mask is None:
         warnings.append("event_mask_test.npy is missing; core metrics are unavailable.")
-    metrics = compute_metrics(real, gen, cond, cfg.max_lag, event_mask=event_mask)
+    metrics = compute_metrics(
+        real,
+        gen,
+        cond,
+        cfg.max_lag,
+        event_mask=event_mask,
+        ramp_metric_mode=cfg.ramp_metric_mode,
+        ramp_window_hours=cfg.ramp_window_hours,
+        multiscale_ramp_windows=cfg.multiscale_ramp_windows,
+    )
     if event_mask is None:
         metrics["core_q99_cum_deficit_error"] = float("nan")
-    highrisk_metrics, highrisk_warning = compute_highrisk_metrics(real, gen, cond, cfg.max_lag, event_mask=event_mask)
+    highrisk_metrics, highrisk_warning = compute_highrisk_metrics(
+        real,
+        gen,
+        cond,
+        cfg.max_lag,
+        event_mask=event_mask,
+        ramp_metric_mode=cfg.ramp_metric_mode,
+        ramp_window_hours=cfg.ramp_window_hours,
+        multiscale_ramp_windows=cfg.multiscale_ramp_windows,
+    )
     metrics.update(highrisk_metrics)
     if highrisk_warning:
         warnings.append(highrisk_warning)
@@ -400,6 +450,9 @@ def evaluate_generation(cfg: EvalConfig) -> dict:
         "warnings": warnings,
         "paper_main_metrics": {metric: metrics.get(metric) for metric in EXTREME_MAIN_METRICS},
         "auxiliary_global_stat_metrics": {metric: metrics.get(metric) for metric in AUXILIARY_GLOBAL_STAT_METRICS},
+        "ramp_metric_mode": cfg.ramp_metric_mode,
+        "ramp_window_hours": cfg.ramp_window_hours,
+        "multiscale_ramp_windows": cfg.multiscale_ramp_windows,
         "metrics": metrics,
     }
     (out_dir / "evaluation_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -416,6 +469,9 @@ def parse_args() -> EvalConfig:
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--max-lag", type=int, default=12)
     parser.add_argument("--event-mask", type=str, default=None)
+    parser.add_argument("--ramp-metric-mode", type=str, default="one_step", choices=["one_step", "window_1h", "window_2h", "window_3h", "multiscale"])
+    parser.add_argument("--ramp-window-hours", type=float, default=1.0)
+    parser.add_argument("--multiscale-ramp-windows", type=str, default="1.0,2.0,3.0")
     args = parser.parse_args()
     return EvalConfig(
         real=args.real,
@@ -426,6 +482,9 @@ def parse_args() -> EvalConfig:
         model_name=args.model_name,
         max_lag=args.max_lag,
         event_mask=args.event_mask,
+        ramp_metric_mode=args.ramp_metric_mode,
+        ramp_window_hours=args.ramp_window_hours,
+        multiscale_ramp_windows=args.multiscale_ramp_windows,
     )
 
 

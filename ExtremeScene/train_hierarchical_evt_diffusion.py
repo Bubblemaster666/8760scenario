@@ -142,6 +142,11 @@ class TrainConfig:
     lambda_ramp_event: float = 0.0
     ramp_peak_softmax_temp: float = 0.2
 
+    # Ramp metric mode controls how netload_ramp_max is computed in risk loss.
+    ramp_metric_mode: str = "one_step"
+    ramp_window_hours: float = 1.0
+    multiscale_ramp_windows: str = "1.0,2.0,3.0"
+
     duration_temp: float = 12.0
     delta_t_hours: float = 1.0
     daylight_start_hour: int = 6
@@ -559,6 +564,9 @@ def _forward_loss(
         delta_t_hours=cfg.delta_t_hours,
         duration_temp=cfg.duration_temp,
         risk_norm=risk_norm,
+        ramp_metric_mode=cfg.ramp_metric_mode,
+        ramp_window_hours=cfg.ramp_window_hours,
+        multiscale_ramp_windows=cfg.multiscale_ramp_windows,
     )
     weighted_risk_loss = cfg.lambda_cum * cum_loss + cfg.lambda_ramp * ramp_loss + cfg.lambda_dur * dur_loss
     cum_pred, _, dur_pred = soft_risk_metrics_torch(
@@ -566,6 +574,9 @@ def _forward_loss(
         tau=risk_targets[:, 3],
         delta_t_hours=cfg.delta_t_hours,
         duration_temp=cfg.duration_temp,
+        ramp_metric_mode=cfg.ramp_metric_mode,
+        ramp_window_hours=cfg.ramp_window_hours,
+        multiscale_ramp_windows=cfg.multiscale_ramp_windows,
     )
     # 单边压 duration：只惩罚生成持续失衡时长超过目标时长的部分。
     dur_over = F.relu((dur_pred - risk_targets[:, 2]) / risk_norm["dur_std"])
@@ -1417,6 +1428,9 @@ def train_model(cfg: TrainConfig) -> dict:
         "use_ramp_event_loss": bool(cfg.use_ramp_event_loss),
         "lambda_ramp_event": float(cfg.lambda_ramp_event),
         "ramp_peak_softmax_temp": float(cfg.ramp_peak_softmax_temp),
+        "ramp_metric_mode": cfg.ramp_metric_mode,
+        "ramp_window_hours": float(cfg.ramp_window_hours),
+        "multiscale_ramp_windows": cfg.multiscale_ramp_windows,
         "lambda_recon": cfg.lambda_recon,
             "lambda_physics": cfg.lambda_physics,
             "lambda_resource": cfg.lambda_resource,
@@ -1502,6 +1516,9 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--use-ramp-event-loss", action="store_true", help="?? ramp event consistency loss?")
     parser.add_argument("--lambda-ramp-event", type=float, default=0.0)
     parser.add_argument("--ramp-peak-softmax-temp", type=float, default=0.2)
+    parser.add_argument("--ramp-metric-mode", type=str, default="one_step", choices=["one_step", "window_1h", "window_2h", "window_3h", "multiscale"])
+    parser.add_argument("--ramp-window-hours", type=float, default=1.0)
+    parser.add_argument("--multiscale-ramp-windows", type=str, default="1.0,2.0,3.0")
     parser.add_argument("--cond-dropout", type=float, default=0.10)
     parser.add_argument("--ema-decay", type=float, default=0.995)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
@@ -1591,6 +1608,9 @@ def parse_args() -> TrainConfig:
         use_ramp_event_loss=args.use_ramp_event_loss,
         lambda_ramp_event=args.lambda_ramp_event,
         ramp_peak_softmax_temp=args.ramp_peak_softmax_temp,
+        ramp_metric_mode=args.ramp_metric_mode,
+        ramp_window_hours=args.ramp_window_hours,
+        multiscale_ramp_windows=args.multiscale_ramp_windows,
         device=args.device,
         use_augmented_train=args.use_augmented_train,
         use_pretrain=args.use_pretrain,

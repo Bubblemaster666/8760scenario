@@ -593,6 +593,9 @@ def risk_consistency_loss(
     delta_t_hours: float,
     duration_temp: float,
     risk_norm: dict[str, torch.Tensor],
+    ramp_metric_mode: str = "one_step",
+    ramp_window_hours: float = 1.0,
+    multiscale_ramp_windows: str | list[float] | tuple[float, ...] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     tau = risk_targets[:, 3]
     target_cum = risk_targets[:, 0]
@@ -604,6 +607,9 @@ def risk_consistency_loss(
         tau=tau,
         delta_t_hours=delta_t_hours,
         duration_temp=duration_temp,
+        ramp_metric_mode=ramp_metric_mode,
+        ramp_window_hours=ramp_window_hours,
+        multiscale_ramp_windows=multiscale_ramp_windows,
     )
     cum_loss = F.l1_loss(
         (torch.log1p(cum_pred) - risk_norm["log_cum_mean"]) / risk_norm["log_cum_std"],
