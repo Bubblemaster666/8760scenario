@@ -13,6 +13,14 @@ from scipy.stats import wasserstein_distance
 
 from evt_fit import EVTConfig, fit_evt_and_label
 from risk_metrics import batch_hard_risk_metrics
+from risk_ranking_utils import (
+    AUXILIARY_REALISM_METRICS,
+    OPTIONAL_RISK_CONTROL_METRICS,
+    RISK_EVALUATION_EXPLANATION,
+    RISK_MAIN_METRICS,
+    RISK_RANKING_EXPLANATION,
+    write_risk_tables,
+)
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -28,27 +36,14 @@ class EvalConfig:
     model_name: str
     max_lag: int = 12
     event_mask: str | None = None
-    ramp_metric_mode: str = "one_step"
-    ramp_window_hours: float = 1.0
+    ramp_metric_mode: str = "window_3h"
+    ramp_window_hours: float = 3.0
     multiscale_ramp_windows: str = "1.0,2.0,3.0"
 
 
-EXTREME_MAIN_METRICS = [
-    "highrisk_wasserstein",
-    "highrisk_acf_mae",
-    "extreme_degree_match_rate",
-    "q99_cum_deficit_error",
-    "core_q99_cum_deficit_error",
-    "netload_ramp_max_mae",
-    "imbalance_duration_mae",
-]
+EXTREME_MAIN_METRICS = [*RISK_MAIN_METRICS, *OPTIONAL_RISK_CONTROL_METRICS]
 
-AUXILIARY_GLOBAL_STAT_METRICS = [
-    "mean_wasserstein",
-    "mean_js",
-    "acf_mae",
-    "corr_matrix_error",
-]
+AUXILIARY_GLOBAL_STAT_METRICS = AUXILIARY_REALISM_METRICS
 
 HIGHRISK_METRIC_MAP = {
     "mean_wasserstein": "highrisk_wasserstein",
@@ -277,11 +272,30 @@ def compute_highrisk_metrics(
     return out, None
 
 
-def _group_metrics(real: np.ndarray, gen: np.ndarray, cond: pd.DataFrame, group_col: str, max_lag: int, event_mask: np.ndarray | None = None) -> pd.DataFrame:
+def _group_metrics(
+    real: np.ndarray,
+    gen: np.ndarray,
+    cond: pd.DataFrame,
+    group_col: str,
+    max_lag: int,
+    event_mask: np.ndarray | None = None,
+    ramp_metric_mode: str = "window_3h",
+    ramp_window_hours: float = 3.0,
+    multiscale_ramp_windows: str = "1.0,2.0,3.0",
+) -> pd.DataFrame:
     rows = []
     for value, sub_idx in cond.groupby(group_col).groups.items():
         idx = np.asarray(list(sub_idx), dtype=int)
-        sub_metrics = compute_metrics(real[idx], gen[idx], cond.iloc[idx].reset_index(drop=True), max_lag=max_lag, event_mask=None if event_mask is None else event_mask[idx])
+        sub_metrics = compute_metrics(
+            real[idx],
+            gen[idx],
+            cond.iloc[idx].reset_index(drop=True),
+            max_lag=max_lag,
+            event_mask=None if event_mask is None else event_mask[idx],
+            ramp_metric_mode=ramp_metric_mode,
+            ramp_window_hours=ramp_window_hours,
+            multiscale_ramp_windows=multiscale_ramp_windows,
+        )
         sub_metrics[group_col] = value
         rows.append(sub_metrics)
     return pd.DataFrame(rows)
@@ -350,11 +364,33 @@ def _plot_corr(real: np.ndarray, gen: np.ndarray, out_dir: Path) -> None:
         plt.close()
 
 
-def _plot_risk_boxplot(real: np.ndarray, gen: np.ndarray, cond: pd.DataFrame, out_dir: Path) -> pd.DataFrame:
+def _plot_risk_boxplot(
+    real: np.ndarray,
+    gen: np.ndarray,
+    cond: pd.DataFrame,
+    out_dir: Path,
+    ramp_metric_mode: str = "window_3h",
+    ramp_window_hours: float = 3.0,
+    multiscale_ramp_windows: str = "1.0,2.0,3.0",
+) -> pd.DataFrame:
     tau = cond["imbalance_tau"].astype(float).to_numpy() if "imbalance_tau" in cond.columns else np.zeros((len(cond),), dtype=float)
     delta_t = float(cond["delta_t_hours"].astype(float).iloc[0]) if "delta_t_hours" in cond.columns else 1.0
-    risk_real = batch_hard_risk_metrics(real, tau=tau, delta_t_hours=delta_t)
-    risk_gen = batch_hard_risk_metrics(gen, tau=tau, delta_t_hours=delta_t)
+    risk_real = batch_hard_risk_metrics(
+        real,
+        tau=tau,
+        delta_t_hours=delta_t,
+        ramp_metric_mode=ramp_metric_mode,
+        ramp_window_hours=ramp_window_hours,
+        multiscale_ramp_windows=multiscale_ramp_windows,
+    )
+    risk_gen = batch_hard_risk_metrics(
+        gen,
+        tau=tau,
+        delta_t_hours=delta_t,
+        ramp_metric_mode=ramp_metric_mode,
+        ramp_window_hours=ramp_window_hours,
+        multiscale_ramp_windows=multiscale_ramp_windows,
+    )
     rows = []
     for metric_name in ["cum_deficit", "netload_ramp_max", "imbalance_duration"]:
         for i, sample_id in enumerate(cond["sample_id"]):
@@ -421,22 +457,50 @@ def evaluate_generation(cfg: EvalConfig) -> dict:
 
     metrics_df = pd.DataFrame([metrics])
     metrics_df.to_csv(out_dir / "metrics_summary.csv", index=False, encoding="utf-8-sig")
+    risk_main_df = metrics_df.rename(columns={"model_name": "method"})
+    risk_table, aux_table = write_risk_tables(risk_main_df, out_dir, method_col="method")
+    risk_table.rename(columns={"method": "model_name"}).to_csv(out_dir / "risk_main_metrics_summary.csv", index=False, encoding="utf-8-sig")
     extreme_columns = ["model_name", *EXTREME_MAIN_METRICS]
-    pd.DataFrame([{col: metrics.get(col, np.nan) for col in extreme_columns}]).to_csv(
-        out_dir / "extreme_metrics_summary.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
+    pd.DataFrame([{col: metrics.get(col, np.nan) for col in extreme_columns}]).to_csv(out_dir / "extreme_metrics_summary.csv", index=False, encoding="utf-8-sig")
     auxiliary_columns = ["model_name", *AUXILIARY_GLOBAL_STAT_METRICS]
     pd.DataFrame([{col: metrics.get(col, np.nan) for col in auxiliary_columns}]).to_csv(
         out_dir / "auxiliary_global_stat_metrics.csv",
         index=False,
         encoding="utf-8-sig",
     )
-    _group_metrics(real, gen, cond, "event_type", cfg.max_lag, event_mask=event_mask).to_csv(out_dir / "metrics_by_event_type.csv", index=False, encoding="utf-8-sig")
-    _group_metrics(real, gen, cond, "severity_level", cfg.max_lag, event_mask=event_mask).to_csv(out_dir / "metrics_by_severity.csv", index=False, encoding="utf-8-sig")
+    aux_table.rename(columns={"method": "model_name"}).to_csv(out_dir / "auxiliary_realism_metrics.csv", index=False, encoding="utf-8-sig")
+    _group_metrics(
+        real,
+        gen,
+        cond,
+        "event_type",
+        cfg.max_lag,
+        event_mask=event_mask,
+        ramp_metric_mode=cfg.ramp_metric_mode,
+        ramp_window_hours=cfg.ramp_window_hours,
+        multiscale_ramp_windows=cfg.multiscale_ramp_windows,
+    ).to_csv(out_dir / "metrics_by_event_type.csv", index=False, encoding="utf-8-sig")
+    _group_metrics(
+        real,
+        gen,
+        cond,
+        "severity_level",
+        cfg.max_lag,
+        event_mask=event_mask,
+        ramp_metric_mode=cfg.ramp_metric_mode,
+        ramp_window_hours=cfg.ramp_window_hours,
+        multiscale_ramp_windows=cfg.multiscale_ramp_windows,
+    ).to_csv(out_dir / "metrics_by_severity.csv", index=False, encoding="utf-8-sig")
 
-    risk_df = _plot_risk_boxplot(real, gen, cond, figures_dir)
+    risk_df = _plot_risk_boxplot(
+        real,
+        gen,
+        cond,
+        figures_dir,
+        ramp_metric_mode=cfg.ramp_metric_mode,
+        ramp_window_hours=cfg.ramp_window_hours,
+        multiscale_ramp_windows=cfg.multiscale_ramp_windows,
+    )
     risk_df.to_csv(out_dir / "risk_metrics_real_vs_generated.csv", index=False, encoding="utf-8-sig")
     _plot_typical_curves(real, gen, cond, figures_dir)
     _plot_acf(real, gen, cfg.max_lag, figures_dir)
@@ -448,8 +512,13 @@ def evaluate_generation(cfg: EvalConfig) -> dict:
         "risk_metric_scope": "both" if event_mask is not None else "full_window",
         "event_mask_used": bool(event_mask is not None),
         "warnings": warnings,
-        "paper_main_metrics": {metric: metrics.get(metric) for metric in EXTREME_MAIN_METRICS},
+        "paper_main_metrics": {metric: metrics.get(metric) for metric in RISK_MAIN_METRICS},
+        "optional_risk_control_metrics": {metric: metrics.get(metric) for metric in OPTIONAL_RISK_CONTROL_METRICS},
         "auxiliary_global_stat_metrics": {metric: metrics.get(metric) for metric in AUXILIARY_GLOBAL_STAT_METRICS},
+        "risk_score": float(risk_table["risk_score"].iloc[0]) if "risk_score" in risk_table.columns and len(risk_table) else None,
+        "risk_rank": int(risk_table["risk_rank"].iloc[0]) if "risk_rank" in risk_table.columns and len(risk_table) and not pd.isna(risk_table["risk_rank"].iloc[0]) else None,
+        "ranking_logic": RISK_RANKING_EXPLANATION,
+        "evaluation_logic": RISK_EVALUATION_EXPLANATION,
         "ramp_metric_mode": cfg.ramp_metric_mode,
         "ramp_window_hours": cfg.ramp_window_hours,
         "multiscale_ramp_windows": cfg.multiscale_ramp_windows,
@@ -469,8 +538,8 @@ def parse_args() -> EvalConfig:
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--max-lag", type=int, default=12)
     parser.add_argument("--event-mask", type=str, default=None)
-    parser.add_argument("--ramp-metric-mode", type=str, default="one_step", choices=["one_step", "window_1h", "window_2h", "window_3h", "multiscale"])
-    parser.add_argument("--ramp-window-hours", type=float, default=1.0)
+    parser.add_argument("--ramp-metric-mode", type=str, default="window_3h", choices=["one_step", "window_1h", "window_2h", "window_3h", "multiscale"])
+    parser.add_argument("--ramp-window-hours", type=float, default=3.0)
     parser.add_argument("--multiscale-ramp-windows", type=str, default="1.0,2.0,3.0")
     args = parser.parse_args()
     return EvalConfig(

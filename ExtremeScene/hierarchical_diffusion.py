@@ -63,6 +63,8 @@ def build_condition_bundle(
     daylight_start_hour: int = 6,
     daylight_end_hour: int = 18,
     use_risk_profile_condition: bool = False,
+    use_jirp_v2_condition: bool = False,
+    use_jirp_continuous_values: bool = True,
     use_mask_condition: bool = False,
     use_ramp_event_condition: bool = False,
     ramp_event_condition_scale: float = 1.0,
@@ -163,6 +165,40 @@ def build_condition_bundle(
             profile = np.zeros((len(cond_df),), dtype=np.float32)
         risk_parts.append((profile / 63.0)[:, None])
         risk_layout["risk_profile_id_scaled"] = [offset]
+    if use_jirp_v2_condition:
+        # JIRP-v2 条件刻画三类联合失衡风险：累计性 C、突发性 R、持续性 D。
+        # 这里使用等级 one-hot/profile scaled 和连续强度 zscore，经条件 MLP 学习，
+        # 等价于轻量可学习的风险剖面编码，默认关闭时不影响原方法复现。
+        for col, key in [
+            ("jirp_cum_level", "jirp_cum_level_onehot"),
+            ("jirp_ramp_level", "jirp_ramp_level_onehot"),
+            ("jirp_duration_level", "jirp_duration_level_onehot"),
+        ]:
+            offset = sum(part.shape[1] for part in risk_parts)
+            if col in cond_df.columns:
+                level = pd.to_numeric(cond_df[col], errors="coerce").fillna(0).clip(0, 3).astype(int).to_numpy()
+            else:
+                level = np.zeros((len(cond_df),), dtype=np.int64)
+            onehot = np.eye(4, dtype=np.float32)[level]
+            risk_parts.append(onehot)
+            risk_layout[key] = list(range(offset, offset + 4))
+        offset = sum(part.shape[1] for part in risk_parts)
+        if "jirp_profile_id" in cond_df.columns:
+            profile = pd.to_numeric(cond_df["jirp_profile_id"], errors="coerce").fillna(0.0).clip(0, 63).to_numpy(dtype=np.float32)
+        else:
+            profile = np.zeros((len(cond_df),), dtype=np.float32)
+        risk_parts.append((profile / 63.0)[:, None])
+        risk_layout["jirp_profile_id_scaled"] = [offset]
+        if use_jirp_continuous_values:
+            for col, key in [
+                ("jirp_cum_intensity_zscore", "jirp_cum_intensity_zscore"),
+                ("jirp_ramp_tail_intensity_zscore", "jirp_ramp_tail_intensity_zscore"),
+                ("jirp_duration_zscore", "jirp_duration_zscore"),
+            ]:
+                offset = sum(part.shape[1] for part in risk_parts)
+                values = pd.to_numeric(cond_df[col], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32) if col in cond_df.columns else np.zeros((len(cond_df),), dtype=np.float32)
+                risk_parts.append(values[:, None])
+                risk_layout[key] = [offset]
     if use_mask_condition:
         # mask_prob_t 是风险过程先验：第 t 个小时净负荷超过失衡阈值 tau 的概率。
         offset = sum(part.shape[1] for part in risk_parts)
@@ -196,6 +232,24 @@ def build_condition_bundle(
     for col in ["cum_level", "ramp_level", "duration_level", "risk_profile_id"]:
         risk_targets_df[col] = pd.to_numeric(cond_df[col], errors="coerce").fillna(0.0) if col in cond_df.columns else 0.0
     for col in ["ramp_peak_time", "ramp_peak_value", "ramp_width", "ramp_source_type"]:
+        risk_targets_df[col] = pd.to_numeric(cond_df[col], errors="coerce").fillna(0.0) if col in cond_df.columns else 0.0
+    # jirp_tail_score is the Stage 2 joint imbalance risk-profile tail score.
+    # It combines cumulative deficit, 3h net-load ramp, and imbalance duration ranks.
+    risk_targets_df["jirp_tail_score"] = pd.to_numeric(cond_df["jirp_tail_score"], errors="coerce").fillna(0.0) if "jirp_tail_score" in cond_df.columns else 0.0
+    # hybrid_tail_score protects the original cum-deficit EVT tail anchor while
+    # adding JIRP-v2 C/R/D tail information for Stage 2.
+    for col in [
+        "hybrid_tail_score",
+        "jirp_cum_intensity",
+        "jirp_ramp_tail_intensity",
+        "jirp_duration",
+        "jirp_cum_level",
+        "jirp_ramp_level",
+        "jirp_duration_level",
+        "jirp_profile_id",
+        "old_tail_score_rank",
+        "jirp_v2_tail_score",
+    ]:
         risk_targets_df[col] = pd.to_numeric(cond_df[col], errors="coerce").fillna(0.0) if col in cond_df.columns else 0.0
     risk_targets = risk_targets_df.to_numpy(dtype=np.float32)
 
@@ -239,7 +293,10 @@ class ConditionedWindowDataset(Dataset):
         daylight_start_hour: int = 6,
         daylight_end_hour: int = 18,
         event_mask: Optional[np.ndarray] = None,
+        risk_profile: Optional[np.ndarray] = None,
         use_risk_profile_condition: bool = False,
+        use_jirp_v2_condition: bool = False,
+        use_jirp_continuous_values: bool = True,
         use_mask_condition: bool = False,
         use_ramp_event_condition: bool = False,
         ramp_event_condition_scale: float = 1.0,
@@ -260,6 +317,8 @@ class ConditionedWindowDataset(Dataset):
             daylight_start_hour=daylight_start_hour,
             daylight_end_hour=daylight_end_hour,
             use_risk_profile_condition=use_risk_profile_condition,
+            use_jirp_v2_condition=use_jirp_v2_condition,
+            use_jirp_continuous_values=use_jirp_continuous_values,
             use_mask_condition=use_mask_condition,
             use_ramp_event_condition=use_ramp_event_condition,
             ramp_event_condition_scale=ramp_event_condition_scale,
@@ -269,6 +328,14 @@ class ConditionedWindowDataset(Dataset):
         self.risk = arrays["risk"]
         self.day_mask = arrays["day_mask"]
         self.risk_targets = arrays["risk_targets"]
+        if risk_profile is None:
+            self.risk_profile = np.zeros((len(self.X), 4, seq_len), dtype=np.float32)
+            self.risk_profile_available = False
+        else:
+            if risk_profile.shape != (len(self.X), 4, seq_len):
+                raise ValueError(f"Expected risk_profile with shape {(len(self.X), 4, seq_len)}, got {risk_profile.shape}.")
+            self.risk_profile = risk_profile.astype(np.float32)
+            self.risk_profile_available = True
         if event_mask is None:
             self.event_mask = np.ones((len(self.X), seq_len), dtype=np.float32)
             self.event_mask_available = False
@@ -279,6 +346,8 @@ class ConditionedWindowDataset(Dataset):
             self.event_mask_available = True
         self.condition_meta = layout
         self.condition_meta["event_mask_available"] = self.event_mask_available
+        self.condition_meta["risk_profile_available"] = self.risk_profile_available
+        self.condition_meta["risk_profile_shape"] = list(self.risk_profile.shape[1:])
 
     def __len__(self) -> int:
         return len(self.X)
@@ -292,6 +361,7 @@ class ConditionedWindowDataset(Dataset):
             torch.from_numpy(self.risk_targets[idx]),
             torch.from_numpy(self.day_mask[idx]),
             torch.from_numpy(self.event_mask[idx]),
+            torch.from_numpy(self.risk_profile[idx]),
         )
 
 
@@ -397,6 +467,28 @@ class FlatConditionEncoder(nn.Module):
         return fused, fused, fused, fused
 
 
+class RiskProfileEncoder1D(nn.Module):
+    def __init__(self, profile_channels: int, cond_dim: int, local_channels: int) -> None:
+        super().__init__()
+        self.global_encoder = nn.Sequential(
+            nn.Conv1d(profile_channels, cond_dim, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv1d(cond_dim, cond_dim, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.local_encoder = nn.Sequential(
+            nn.Conv1d(profile_channels, local_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv1d(local_channels, local_channels, kernel_size=3, padding=1),
+        )
+
+    def forward(self, profile_cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        global_emb = self.global_encoder(profile_cond).squeeze(-1)
+        local_emb = self.local_encoder(profile_cond)
+        return global_emb, local_emb
+
+
 class HierarchicalConditionalUNet1D(nn.Module):
     def __init__(
         self,
@@ -408,11 +500,13 @@ class HierarchicalConditionalUNet1D(nn.Module):
         proc_dim: int,
         risk_dim: int,
         flat_condition: bool = False,
+        profile_channels: int = 0,
     ) -> None:
         super().__init__()
         self.bg_dim = bg_dim
         self.proc_dim = proc_dim
         self.risk_dim = risk_dim
+        self.profile_channels = int(profile_channels)
         self.time_mlp = nn.Sequential(
             SinusoidalTimeEmbedding(time_dim),
             nn.Linear(time_dim, time_dim),
@@ -424,6 +518,11 @@ class HierarchicalConditionalUNet1D(nn.Module):
         else:
             self.cond_encoder = HierarchicalConditionEncoder(bg_dim, proc_dim, risk_dim, cond_dim)
         self.init_conv = nn.Conv1d(in_channels, base_channels, kernel_size=3, padding=1)
+        self.profile_encoder = (
+            RiskProfileEncoder1D(self.profile_channels, cond_dim, base_channels)
+            if self.profile_channels > 0
+            else None
+        )
         self.down1 = DownBlock(base_channels, base_channels, time_dim, cond_dim)
         self.down2 = DownBlock(base_channels, base_channels * 2, time_dim, cond_dim)
         self.mid1 = ResidualBlock1D(base_channels * 2, base_channels * 4, time_dim, cond_dim)
@@ -451,17 +550,28 @@ class HierarchicalConditionalUNet1D(nn.Module):
         bg_cond: Optional[torch.Tensor],
         proc_cond: Optional[torch.Tensor],
         risk_cond: Optional[torch.Tensor],
+        profile_cond: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size = x.size(0)
         time_emb = self.time_mlp(t)
         if bg_cond is None or proc_cond is None or risk_cond is None:
             bg_cond, proc_cond, risk_cond = self._zero_bundle(batch_size, x.device)
         bg_emb, proc_emb, risk_emb, fused_emb = self.cond_encoder(bg_cond, proc_cond, risk_cond)
+        profile_local = None
+        if self.profile_encoder is not None:
+            if profile_cond is None:
+                profile_cond = torch.zeros(batch_size, self.profile_channels, x.shape[-1], device=x.device, dtype=x.dtype)
+            profile_global, profile_local = self.profile_encoder(profile_cond)
+            fused_emb = fused_emb + profile_global
         down_cond = bg_emb + fused_emb
         mid_cond = proc_emb + fused_emb
         up_cond = risk_emb + fused_emb
 
         x0 = self.init_conv(x)
+        if profile_local is not None:
+            if profile_local.shape[-1] != x0.shape[-1]:
+                profile_local = F.interpolate(profile_local, size=x0.shape[-1], mode="nearest")
+            x0 = x0 + profile_local
         x1, skip1 = self.down1(x0, time_emb, down_cond)
         x2, skip2 = self.down2(x1, time_emb, down_cond)
         h = self.mid1(x2, time_emb, mid_cond)
@@ -504,11 +614,12 @@ class DiffusionScheduler(nn.Module):
         bg_cond: Optional[torch.Tensor],
         proc_cond: Optional[torch.Tensor],
         risk_cond: Optional[torch.Tensor],
+        profile_cond: Optional[torch.Tensor],
         guidance_scale: float,
     ) -> torch.Tensor:
-        pred_cond = model(x, t, bg_cond, proc_cond, risk_cond)
+        pred_cond = model(x, t, bg_cond, proc_cond, risk_cond, profile_cond)
         if guidance_scale != 1.0:
-            pred_uncond = model(x, t, None, None, None)
+            pred_uncond = model(x, t, None, None, None, None)
             pred_noise = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
         else:
             pred_noise = pred_cond
@@ -633,6 +744,7 @@ def sample_sequences(
     bg_cond: torch.Tensor,
     proc_cond: torch.Tensor,
     risk_cond: torch.Tensor,
+    profile_cond: Optional[torch.Tensor],
     shape: tuple[int, int, int],
     guidance_scale: float,
     device: torch.device,
@@ -667,9 +779,9 @@ def sample_sequences(
         if use_risk_guidance:
             # Classifier guidance 只使用 cond 中的目标风险等级，不使用真实测试曲线。
             x_req = x.detach().requires_grad_(True)
-            pred_cond = model(x_req, t, bg_cond, proc_cond, risk_cond)
+            pred_cond = model(x_req, t, bg_cond, proc_cond, risk_cond, profile_cond)
             if guidance_scale != 1.0:
-                pred_uncond = model(x_req, t, None, None, None)
+                pred_uncond = model(x_req, t, None, None, None, None)
                 pred_noise = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
             else:
                 pred_noise = pred_cond
@@ -688,17 +800,24 @@ def sample_sequences(
             grad = torch.autograd.grad(loss, x_req, retain_graph=False, create_graph=False)[0]
             grad_scale = grad.flatten(1).std(dim=1).view(-1, 1, 1).clamp(min=1e-6)
             x = (x_req - float(risk_guidance_scale) * grad / grad_scale).detach()
-        x = scheduler.p_sample(model, x, t, bg_cond, proc_cond, risk_cond, guidance_scale)
+        x = scheduler.p_sample(model, x, t, bg_cond, proc_cond, risk_cond, profile_cond, guidance_scale)
     return x
 
 
-def load_split_arrays(data_dir: str | Path, split: str, include_event_mask: bool = False):
+def load_split_arrays(data_dir: str | Path, split: str, include_event_mask: bool = False, include_risk_profile: bool = False):
     root = Path(data_dir)
     x = np.load(root / f"X_{split}.npy").astype(np.float32)
     cond_df = pd.read_csv(root / f"cond_{split}.csv")
     meta_df = pd.read_csv(root / f"meta_{split}.csv")
+    extras = []
     if include_event_mask:
         mask_path = root / f"event_mask_{split}.npy"
         event_mask = np.load(mask_path).astype(np.float32) if mask_path.exists() else None
-        return x, cond_df, meta_df, event_mask
+        extras.append(event_mask)
+    if include_risk_profile:
+        profile_path = root / f"risk_profile_{split}.npy"
+        risk_profile = np.load(profile_path).astype(np.float32) if profile_path.exists() else None
+        extras.append(risk_profile)
+    if extras:
+        return x, cond_df, meta_df, *extras
     return x, cond_df, meta_df

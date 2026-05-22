@@ -1,0 +1,11 @@
+本包内所有 Python 文件均保持原文件名不变，可直接复制覆盖原项目对应文件。
+主要修改：
+1. 将主事件中的“暴雪/风吹雪”调整为“暴雨/强降水”，保留旧名称兼容映射。
+2. 默认 seq_len 改为 36h，并在数据构建中生成 event_mask。
+3. 增加 risk screening、monthly/seasonal tau、hybrid severity 分级。
+4. 增加 core_* 核心事件段风险评价指标。
+5. 训练脚本支持增强训练集，并保存 best_model.pt / best_risk_model.pt / final_model.pt。
+6. 生成脚本支持 checkpoint-type 和 duration-hours。
+7. 实验脚本支持 no_evt_strict、checkpoint_type、use_augmented_train。
+8. 数据增强脚本只增强训练集，不动验证集和测试集。
+9. 已通过 py_compile 检查，并用 mock 数据跑通过“构建样本库 + 诊断”流程。

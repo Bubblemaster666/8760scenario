@@ -1,9 +1,20 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import csv
 import json
 from pathlib import Path
+
+import pandas as pd
+
+from risk_ranking_utils import (
+    AUXILIARY_REALISM_METRICS,
+    RISK_EVALUATION_EXPLANATION,
+    RISK_MAIN_METRICS,
+    RISK_RANKING_EXPLANATION,
+    RISK_SCORE_WEIGHTS,
+    add_risk_score,
+)
 
 
 STAT_METRICS = [
@@ -13,38 +24,15 @@ STAT_METRICS = [
     "corr_matrix_error",
 ]
 
-RISK_LOWER_BETTER = [
-    "highrisk_wasserstein",
-    "highrisk_acf_mae",
-    "q99_cum_deficit_error",
-    "core_q99_cum_deficit_error",
-    "netload_ramp_max_mae",
-    "imbalance_duration_mae",
-]
+RISK_LOWER_BETTER = RISK_MAIN_METRICS
 
 RISK_HIGHER_BETTER = [
     "extreme_degree_match_rate",
 ]
 
-RISK_WEIGHTS = {
-    "highrisk_wasserstein": 1.0,
-    "highrisk_acf_mae": 1.0,
-    "q99_cum_deficit_error": 2.0,
-    "core_q99_cum_deficit_error": 2.0,
-    "netload_ramp_max_mae": 1.0,
-    "imbalance_duration_mae": 1.0,
-    "extreme_degree_match_rate": 1.5,
-}
+RISK_WEIGHTS = RISK_SCORE_WEIGHTS
 
-PAPER_MAIN_METRICS = [
-    "highrisk_wasserstein",
-    "highrisk_acf_mae",
-    "extreme_degree_match_rate",
-    "q99_cum_deficit_error",
-    "core_q99_cum_deficit_error",
-    "netload_ramp_max_mae",
-    "imbalance_duration_mae",
-]
+PAPER_MAIN_METRICS = RISK_MAIN_METRICS
 
 MAIN_COMPARE_ORDER = [
     "traditional_gaussian_copula",
@@ -116,7 +104,7 @@ def write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) 
 
 
 def normalize_row(row: dict[str, str], group: str, source_file: Path, note: str = "") -> dict[str, object]:
-    name = row.get("model_name") or row.get("variant") or row.get("experiment_name") or ""
+    name = row.get("model_name") or row.get("method") or row.get("variant") or row.get("experiment_name") or ""
     out: dict[str, object] = {
         "group": group,
         "experiment_name": name.strip(),
@@ -125,7 +113,8 @@ def normalize_row(row: dict[str, str], group: str, source_file: Path, note: str 
         "note": note,
         "source_file": str(source_file),
     }
-    for metric in STAT_METRICS + RISK_LOWER_BETTER + RISK_HIGHER_BETTER:
+    metric_names = list(dict.fromkeys([*STAT_METRICS, *AUXILIARY_REALISM_METRICS, *RISK_LOWER_BETTER, *RISK_HIGHER_BETTER]))
+    for metric in metric_names:
         out[metric] = safe_float(row.get(metric))
     for extra in ["severity_classification_method", "checkpoint_type_used_for_generation"]:
         if extra in row:
@@ -189,26 +178,24 @@ def _baseline_best_stats(rows: list[dict[str, object]]) -> dict[str, float]:
 
 
 def attach_risk_oriented_scores(rows: list[dict[str, object]]) -> None:
-    for metric in RISK_LOWER_BETTER:
-        ranks = _rank_values(rows, metric, ascending=True)
-        for idx, rank in ranks.items():
-            rows[idx][f"{metric}_extreme_rank"] = rank
-            rows[idx][f"{metric}_weighted_rank"] = rank * RISK_WEIGHTS[metric]
-    for metric in RISK_HIGHER_BETTER:
-        ranks = _rank_values(rows, metric, ascending=False)
-        for idx, rank in ranks.items():
-            rows[idx][f"{metric}_extreme_rank"] = rank
-            rows[idx][f"{metric}_weighted_rank"] = rank * RISK_WEIGHTS[metric]
-
-    for row in rows:
-        weighted_sum = 0.0
-        used_weight = 0.0
-        for metric, weight in RISK_WEIGHTS.items():
-            rank = row.get(f"{metric}_extreme_rank")
-            if isinstance(rank, int):
-                weighted_sum += rank * weight
-                used_weight += weight
-        row["final_extreme_score"] = round(weighted_sum / used_weight, 4) if used_weight else None
+    base = pd.DataFrame(rows)
+    base["_row_id"] = range(len(base))
+    scored = add_risk_score(base)
+    score_by_id = {int(row["_row_id"]): row for row in scored.to_dict(orient="records") if "_row_id" in row}
+    metric_ranks = {metric: _rank_values(rows, metric, ascending=True) for metric in RISK_LOWER_BETTER}
+    for idx, row in enumerate(rows):
+        scored_row = score_by_id.get(idx)
+        if scored_row:
+            row["risk_score"] = scored_row.get("risk_score")
+            row["risk_rank"] = scored_row.get("risk_rank")
+            row["final_extreme_score"] = scored_row.get("risk_score")
+            for metric in RISK_MAIN_METRICS:
+                norm_col = f"norm_{metric}"
+                if norm_col in scored_row:
+                    row[norm_col] = scored_row.get(norm_col)
+        for metric in RISK_LOWER_BETTER:
+            if idx in metric_ranks[metric]:
+                row[f"{metric}_risk_rank"] = metric_ranks[metric][idx]
         row["recommendation_reason"] = _recommendation_reason(row)
 
 
@@ -226,25 +213,22 @@ def _statistical_status(row: dict[str, object]) -> str:
 
 
 def _recommendation_reason(row: dict[str, object]) -> str:
-    q99_rank = row.get("q99_cum_deficit_error_extreme_rank")
-    core_q99_rank = row.get("core_q99_cum_deficit_error_extreme_rank")
-    match_rank = row.get("extreme_degree_match_rate_extreme_rank")
-    highrisk_w_rank = row.get("highrisk_wasserstein_extreme_rank")
-    highrisk_acf_rank = row.get("highrisk_acf_mae_extreme_rank")
-    ramp_rank = row.get("netload_ramp_max_mae_extreme_rank")
-    tail_good = all(isinstance(rank, int) and rank <= 3 for rank in [q99_rank, core_q99_rank, match_rank])
-    dist_good = all(isinstance(rank, int) and rank <= 3 for rank in [highrisk_w_rank, highrisk_acf_rank])
-    risk_good = all(isinstance(rank, int) and rank <= 3 for rank in [q99_rank, core_q99_rank])
-    ramp_weak = isinstance(ramp_rank, int) and ramp_rank >= 5
-    if tail_good:
-        return "recommended due to strong tail-risk and extreme-degree performance"
-    if dist_good and not risk_good:
-        return "good high-risk conditional distribution but weak risk matching"
-    if risk_good and not dist_good:
-        return "risk improved but high-risk conditional distribution needs review"
-    if ramp_weak:
-        return "tail risk is acceptable but ramp process is weak"
-    return "not recommended for extreme scenario generation"
+    rank = row.get("risk_rank")
+    q99_rank = row.get("q99_cum_deficit_error_risk_rank")
+    core_rank = row.get("core_q99_cum_deficit_error_risk_rank")
+    ramp_rank = row.get("netload_ramp_max_mae_risk_rank")
+    duration_rank = row.get("imbalance_duration_mae_risk_rank")
+    try:
+        rank_int = int(rank) if rank is not None and str(rank) != "<NA>" else None
+    except (TypeError, ValueError):
+        rank_int = None
+    if rank_int == 1:
+        return "recommended by joint imbalance risk score"
+    if all(isinstance(item, int) and item <= 3 for item in [q99_rank, core_rank]):
+        return "strong cumulative tail risk, check ramp/duration as secondary risks"
+    if isinstance(ramp_rank, int) and ramp_rank <= 3 and isinstance(duration_rank, int) and duration_rank <= 3:
+        return "good ramp-duration risk but cumulative tail risk needs review"
+    return "not preferred under joint imbalance risk ranking"
 
 
 def sort_by_order(rows: list[dict[str, object]], order: list[str]) -> list[dict[str, object]]:
@@ -292,22 +276,28 @@ def build_markdown(dataset_context: dict[str, object], main_rows: list[dict[str,
                 "",
             ]
         )
+    aux_cols = [m for m in AUXILIARY_REALISM_METRICS if any(m in row for row in main_rows)]
     lines.extend(
         [
             "## Evaluation Logic",
             "",
-            "本文研究对象为重大天气事件下的风光荷联合极端场景生成，而非无条件常规场景生成。因此，正文主评价指标聚焦极端条件下的分布真实性、极端等级控制能力以及联合失衡风险刻画能力。全样本 Wasserstein、JS、ACF 和相关矩阵误差仅作为辅助诊断指标，用于判断生成结果是否发生明显整体失真，不作为方法优劣判断的主要依据。",
+            RISK_EVALUATION_EXPLANATION,
+            RISK_RANKING_EXPLANATION,
             "",
-            "## Main Comparison",
+            "## Main Risk Comparison",
             "",
+            markdown_table(main_rows, ["experiment_name", *PAPER_MAIN_METRICS, "risk_score", "risk_rank", "recommendation_reason"]),
+            "",
+            "## Ablation",
+            "",
+            markdown_table(ablation_rows, ["experiment_name", *PAPER_MAIN_METRICS, "risk_score", "risk_rank", "recommendation_reason"]),
+            "",
+            "## Auxiliary Realism Diagnostics",
+            "",
+            markdown_table(main_rows, ["experiment_name", *aux_cols]),
         ]
     )
-    lines.append(markdown_table(main_rows, ["experiment_name", *PAPER_MAIN_METRICS, "final_extreme_score", "recommendation_reason"]))
-    lines.extend(["", "## Ablation", ""])
-    lines.append(markdown_table(ablation_rows, ["experiment_name", *PAPER_MAIN_METRICS, "final_extreme_score", "recommendation_reason"]))
-    lines.extend(["", "## Auxiliary Global Statistical Diagnostics", ""])
-    lines.append(markdown_table(main_rows, ["experiment_name", *STAT_METRICS]))
-    return "\n".join(lines)
+    return "`n".join(lines)
 
 
 def main() -> None:
@@ -332,9 +322,11 @@ def main() -> None:
         "status",
         "statistical_metrics",
         "extreme_metrics",
-        *STAT_METRICS,
+        *[m for m in AUXILIARY_REALISM_METRICS if any(m in row for row in rows)],
         *RISK_LOWER_BETTER,
         *RISK_HIGHER_BETTER,
+        "risk_score",
+        "risk_rank",
         "final_extreme_score",
         "recommendation_reason",
         "severity_classification_method",
@@ -349,7 +341,12 @@ def main() -> None:
     write_csv(
         args.out_dir / "main_compare_paper_table.csv",
         main_rows,
-        ["experiment_name", *PAPER_MAIN_METRICS, "final_extreme_score", "recommendation_reason"],
+        ["experiment_name", *PAPER_MAIN_METRICS, "risk_score", "risk_rank", "extreme_degree_match_rate", "recommendation_reason"],
+    )
+    write_csv(
+        args.out_dir / "risk_main_compare.csv",
+        sorted(main_rows, key=lambda row: float(row.get("risk_score") or 1e9)),
+        ["experiment_name", *PAPER_MAIN_METRICS, "risk_score", "risk_rank", "extreme_degree_match_rate", "recommendation_reason"],
     )
     write_csv(
         args.out_dir / "auxiliary_global_stat_table.csv",
@@ -357,9 +354,14 @@ def main() -> None:
         ["experiment_name", *STAT_METRICS],
     )
     write_csv(
+        args.out_dir / "auxiliary_realism_metrics.csv",
+        main_rows,
+        ["experiment_name", *[m for m in AUXILIARY_REALISM_METRICS if any(m in row for row in main_rows)], "realism_check_pass"],
+    )
+    write_csv(
         args.out_dir / "ablation_paper_table.csv",
         ablation_rows,
-        ["experiment_name", *PAPER_MAIN_METRICS, "final_extreme_score", "recommendation_reason"],
+        ["experiment_name", *PAPER_MAIN_METRICS, "risk_score", "risk_rank", "extreme_degree_match_rate", "recommendation_reason"],
     )
 
     markdown = build_markdown(load_dataset_context(args.dataset_summary), main_rows, ablation_rows)

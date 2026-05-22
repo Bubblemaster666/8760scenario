@@ -187,7 +187,8 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
     selected_cond, duration_mode = _filter_conditions(cond_df_full, cfg)
     if selected_cond.empty:
         raise ValueError("No conditions matched the requested filters.")
-    selected_meta = meta_df_full.loc[selected_cond.index].reset_index(drop=True)
+    selected_indices = selected_cond.index.to_numpy()
+    selected_meta = meta_df_full.loc[selected_indices].reset_index(drop=True)
     selected_cond = selected_cond.reset_index(drop=True)
 
     cond_normalizers = ConditionNormalizers(**ckpt["condition_normalizers"])
@@ -199,6 +200,8 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
         normalizers=cond_normalizers,
         expected_event_types=len(ckpt["condition_meta"]["background"]["event_onehot"]),
         use_risk_profile_condition=bool(ckpt["train_config"].get("use_risk_profile_condition", False)),
+        use_jirp_v2_condition=bool(ckpt["train_config"].get("use_jirp_v2_condition", False)),
+        use_jirp_continuous_values=bool(ckpt["train_config"].get("use_jirp_continuous_values", True)),
         use_mask_condition=bool(ckpt["train_config"].get("use_mask_condition", False)),
         use_ramp_event_condition=bool(ckpt["train_config"].get("use_ramp_event_condition", False)),
         ramp_event_condition_scale=float(ckpt["train_config"].get("ramp_event_condition_scale", 1.0)),
@@ -206,6 +209,7 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cond_dims = ckpt["cond_dims"]
+    profile_channels = int(cond_dims.get("profile", 0))
     model = HierarchicalConditionalUNet1D(
         in_channels=int(ckpt["train_config"]["in_channels"]),
         base_channels=int(ckpt["train_config"]["base_channels"]),
@@ -215,6 +219,7 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
         proc_dim=int(cond_dims["process"]),
         risk_dim=int(cond_dims["risk"]),
         flat_condition=bool(ckpt["flat_condition"]),
+        profile_channels=profile_channels,
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
@@ -230,6 +235,15 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
     proc = torch.from_numpy(arrays["process"]).to(device)
     risk = torch.from_numpy(arrays["risk"]).to(device)
     day_mask = torch.from_numpy(arrays["day_mask"]).to(device)
+    profile = None
+    if profile_channels > 0:
+        profile_path = data_dir / f"risk_profile_{cfg.split}.npy"
+        if profile_path.exists():
+            profile_np = np.load(profile_path).astype(np.float32)[selected_indices]
+            profile = torch.from_numpy(profile_np).to(device)
+        else:
+            warnings.append(f"risk_profile_{cfg.split}.npy was not found; profile condition is zero-filled.")
+            profile = torch.zeros((len(selected_cond), profile_channels, int(ckpt["seq_len"])), device=device)
     guidance = float(cfg.guidance_scale if cfg.guidance_scale is not None else ckpt["train_config"].get("guidance_scale", 1.0))
     if (
         ckpt["train_config"].get("ablation") == "full"
@@ -244,9 +258,10 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
         bg_sample = bg.repeat_interleave(num_candidates, dim=0)
         proc_sample = proc.repeat_interleave(num_candidates, dim=0)
         risk_sample = risk.repeat_interleave(num_candidates, dim=0)
+        profile_sample = profile.repeat_interleave(num_candidates, dim=0) if profile is not None else None
         day_mask_sample = day_mask.repeat_interleave(num_candidates, dim=0)
     else:
-        bg_sample, proc_sample, risk_sample, day_mask_sample = bg, proc, risk, day_mask
+        bg_sample, proc_sample, risk_sample, profile_sample, day_mask_sample = bg, proc, risk, profile, day_mask
 
     risk_guidance_classifier = None
     risk_guidance_targets = None
@@ -285,6 +300,7 @@ def generate_from_checkpoint(cfg: GenerationConfig) -> dict:
         bg_cond=bg_sample,
         proc_cond=proc_sample,
         risk_cond=risk_sample,
+        profile_cond=profile_sample,
         shape=(bg_sample.shape[0], int(ckpt["train_config"]["in_channels"]), int(ckpt["seq_len"])),
         guidance_scale=guidance,
         device=device,

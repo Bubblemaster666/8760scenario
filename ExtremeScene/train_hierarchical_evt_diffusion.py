@@ -31,14 +31,29 @@ from hierarchical_diffusion import (
 )
 from risk_metrics import (
     highrisk_shape_moment_loss_torch,
+    joint_risk_profile_loss_torch,
     net_load_delta_loss_torch,
     ramp_topk_loss_torch,
     soft_core_risk_metrics_torch,
+    soft_jirp_v2_metrics_torch,
     soft_risk_metrics_torch,
     topk_tail_distribution_loss_torch,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# risk_targets column layout after build_condition_bundle.
+LEGACY_JIRP_TAIL_IDX = 14
+HYBRID_TAIL_IDX = 15
+JIRP_C_IDX = 16
+JIRP_R_IDX = 17
+JIRP_D_IDX = 18
+JIRP_C_LEVEL_IDX = 19
+JIRP_R_LEVEL_IDX = 20
+JIRP_D_LEVEL_IDX = 21
+JIRP_PROFILE_IDX = 22
+OLD_TAIL_RANK_IDX = 23
+JIRP_V2_TAIL_IDX = 24
 
 
 @dataclass
@@ -117,6 +132,38 @@ class TrainConfig:
     risk_profile_duration_balance: bool = True
     use_profile_loss: bool = False
     lambda_profile: float = 0.0
+    # JIRP tail learning uses a joint risk-profile score in Stage 2 instead of
+    # the older cum_deficit-dominated tail_score.
+    use_jirp_tail_score: bool = False
+    lambda_profile_stage2: float = 0.0
+    jirp_cum_alpha: float = 0.5
+    jirp_ramp_alpha: float = 0.3
+    jirp_duration_alpha: float = 0.1
+    jirp_duration_balance: bool = True
+    # JIRP-v2 joint imbalance risk redefinition. C is cumulative imbalance,
+    # R is multiscale ramp-tail intensity, and D is imbalance duration.
+    use_jirp_v2_condition: bool = False
+    jirp_embed_dim: int = 8
+    use_jirp_continuous_values: bool = True
+    use_hybrid_jirp_tail_score: bool = False
+    old_tail_weight: float = 0.70
+    jirp_tail_weight: float = 0.30
+    jirp_cum_weight: float = 0.55
+    jirp_ramp_weight: float = 0.30
+    jirp_duration_weight: float = 0.15
+    lambda_jirp_profile_stage2: float = 0.0
+    lambda_jirp_metric: float = 0.0
+    lambda_jirp_level: float = 0.0
+    jirp_metric_beta_ramp: float = 0.5
+    jirp_metric_beta_duration: float = 0.2
+    hybrid_sampler_old_tail_alpha: float = 0.5
+    hybrid_sampler_cum_alpha: float = 0.3
+    hybrid_sampler_ramp_alpha: float = 0.3
+    hybrid_sampler_duration_alpha: float = 0.1
+    hybrid_sampler_duration_balance: bool = True
+    jirp_ramp_windows: str = "1.0,2.0,3.0"
+    jirp_ramp_topk_ratio: float = 0.10
+    jirp_ramp_definition: str = "multiscale_topk_mean"
 
     # MaskPrior-Diffusion: ??????????????????????
     use_mask_prior: bool = False
@@ -141,6 +188,15 @@ class TrainConfig:
     use_ramp_event_loss: bool = False
     lambda_ramp_event: float = 0.0
     ramp_peak_softmax_temp: float = 0.2
+
+    # Joint risk-profile sequence condition G(t) = [D(t), R3h+(t), C(t), event_mask(t)].
+    use_joint_profile_condition: bool = False
+    use_joint_profile_loss: bool = False
+    lambda_joint_profile_stage2: float = 0.0
+    lambda_joint_profile_stage3: float = 0.0
+    lambda_core_share_stage3: float = 0.0
+    joint_profile_ramp_window_hours: float = 3.0
+    joint_profile_indicator_temp: float = 0.2
 
     # Ramp metric mode controls how netload_ramp_max is computed in risk loss.
     ramp_metric_mode: str = "one_step"
@@ -257,7 +313,12 @@ def stage_weights(stage: str, cfg: TrainConfig) -> dict[str, float]:
         "lambda_duration_over": 0.0,
         "lambda_exceed_mask": 0.0,
         "lambda_profile": 0.0,
+        "lambda_jirp_profile": 0.0,
+        "lambda_jirp_metric": 0.0,
+        "lambda_jirp_level": 0.0,
         "lambda_ramp_event": 0.0,
+        "lambda_joint_profile": 0.0,
+        "lambda_core_share": 0.0,
         "lambda_recon": cfg.lambda_recon,
         "lambda_physics": cfg.lambda_physics,
         "lambda_resource": 0.0,
@@ -267,6 +328,9 @@ def stage_weights(stage: str, cfg: TrainConfig) -> dict[str, float]:
         weights["lambda_resource"] = cfg.lambda_resource
         weights["lambda_delta_net"] = cfg.lambda_delta_net_stage2
         weights["lambda_shape_moment"] = cfg.lambda_shape_stage2
+        weights["lambda_profile"] = cfg.lambda_profile_stage2 if cfg.use_profile_loss else 0.0
+        weights["lambda_jirp_profile"] = cfg.lambda_jirp_profile_stage2
+        weights["lambda_joint_profile"] = cfg.lambda_joint_profile_stage2 if cfg.use_joint_profile_loss else 0.0
     if stage == "stage3_risk":
         weights["lambda_tail"] = cfg.lambda_tail
         weights["lambda_risk"] = 0.0 if cfg.ablation == "no_risk_loss" else cfg.lambda_risk
@@ -281,7 +345,11 @@ def stage_weights(stage: str, cfg: TrainConfig) -> dict[str, float]:
         if cfg.use_mask_consistency_loss:
             weights["lambda_exceed_mask"] = max(weights["lambda_exceed_mask"], cfg.lambda_mask_consistency)
         weights["lambda_profile"] = cfg.lambda_profile if cfg.use_profile_loss else 0.0
+        weights["lambda_jirp_metric"] = 0.0 if cfg.ablation == "no_risk_loss" else cfg.lambda_jirp_metric
+        weights["lambda_jirp_level"] = 0.0 if cfg.ablation == "no_risk_loss" else cfg.lambda_jirp_level
         weights["lambda_ramp_event"] = cfg.lambda_ramp_event if cfg.use_ramp_event_loss else 0.0
+        weights["lambda_joint_profile"] = cfg.lambda_joint_profile_stage3 if cfg.use_joint_profile_loss else 0.0
+        weights["lambda_core_share"] = cfg.lambda_core_share_stage3 if cfg.use_joint_profile_loss else 0.0
     return weights
 
 
@@ -314,6 +382,38 @@ def tail_weight(proc_risk_cond: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
             max=float(cfg.tail_weight_max),
         )
     raise ValueError("tail_weight_mode must be one of {'relu', 'sigmoid', 'clipped_relu'}.")
+
+
+def jirp_tail_weight(risk_targets: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
+    """Build Stage 2 weights from joint imbalance risk-profile tail score.
+
+    risk_targets[:, 14] is jirp_tail_score in [0, 1]. It combines cumulative
+    deficit, 3h net-load ramp, and imbalance duration ranks.
+    """
+
+    if risk_targets.shape[1] <= LEGACY_JIRP_TAIL_IDX:
+        return torch.ones((risk_targets.size(0),), dtype=risk_targets.dtype, device=risk_targets.device)
+    score = risk_targets[:, LEGACY_JIRP_TAIL_IDX].clamp(0.0, 1.0)
+    return 1.0 + score
+
+
+def hybrid_jirp_tail_weight(risk_targets: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
+    """Build Stage 2 weights from hybrid_tail_score.
+
+    hybrid_tail_score keeps the old cum-deficit EVT tail anchor while adding
+    JIRP-v2 C/R/D profile risk. It is stored in risk_targets[:, 15].
+    """
+
+    if risk_targets.shape[1] > JIRP_V2_TAIL_IDX:
+        old_rank = risk_targets[:, OLD_TAIL_RANK_IDX].clamp(0.0, 1.0)
+        jirp_score = risk_targets[:, JIRP_V2_TAIL_IDX].clamp(0.0, 1.0)
+        denom = max(float(cfg.old_tail_weight) + float(cfg.jirp_tail_weight), 1e-6)
+        score = (float(cfg.old_tail_weight) * old_rank + float(cfg.jirp_tail_weight) * jirp_score) / denom
+        return 1.0 + score.clamp(0.0, 1.0)
+    if risk_targets.shape[1] <= HYBRID_TAIL_IDX:
+        return torch.ones((risk_targets.size(0),), dtype=risk_targets.dtype, device=risk_targets.device)
+    score = risk_targets[:, HYBRID_TAIL_IDX].clamp(0.0, 1.0)
+    return 1.0 + score
 
 
 def _parse_severity_sample_weights(text: str) -> dict[int, float]:
@@ -371,6 +471,69 @@ def _profile_consistency_loss(profile_head: RiskProfileHead | None, x_proj: torc
         + F.cross_entropy(logits["ramp_level"], target_ramp)
         + F.cross_entropy(logits["duration_level"], target_duration)
     )
+
+
+def _jirp_profile_consistency_loss(profile_head: RiskProfileHead | None, x_proj: torch.Tensor, risk_targets: torch.Tensor) -> torch.Tensor:
+    """JIRP-v2 profile CE loss for C/R/D levels.
+
+    C_level 表示累计失衡强度等级，R_level 表示突发调节强度等级，
+    D_level 表示持续影响程度等级。
+    """
+
+    if profile_head is None or risk_targets.shape[1] <= JIRP_D_LEVEL_IDX:
+        return x_proj.new_tensor(0.0)
+    logits = profile_head(x_proj)
+    target_c = risk_targets[:, JIRP_C_LEVEL_IDX].long().clamp(0, 3)
+    target_r = risk_targets[:, JIRP_R_LEVEL_IDX].long().clamp(0, 3)
+    target_d = risk_targets[:, JIRP_D_LEVEL_IDX].long().clamp(0, 3)
+    return (
+        F.cross_entropy(logits["cum_level"], target_c)
+        + F.cross_entropy(logits["ramp_level"], target_r)
+        + F.cross_entropy(logits["duration_level"], target_d)
+    )
+
+
+def _jirp_metric_consistency_loss(
+    x_proj: torch.Tensor,
+    risk_targets: torch.Tensor,
+    risk_norm: dict[str, torch.Tensor],
+    cfg: TrainConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """JIRP-v2 Stage 3 metric consistency loss.
+
+    C_pred/C_true 约束累计失衡强度，R_pred/R_true 约束多尺度爬坡尾部强度，
+    D_pred/D_true 约束持续影响程度。
+    """
+
+    if risk_targets.shape[1] <= JIRP_D_IDX:
+        zero = x_proj.new_tensor(0.0)
+        return zero, zero, zero, zero
+    c_pred, r_pred, d_pred = soft_jirp_v2_metrics_torch(
+        x_proj,
+        tau=risk_targets[:, 3],
+        delta_t_hours=cfg.delta_t_hours,
+        duration_temp=cfg.duration_temp,
+        ramp_windows=cfg.jirp_ramp_windows,
+        topk_ratio=cfg.jirp_ramp_topk_ratio,
+        ramp_definition=cfg.jirp_ramp_definition,
+    )
+    c_true = risk_targets[:, JIRP_C_IDX].clamp(min=0.0)
+    r_true = risk_targets[:, JIRP_R_IDX].clamp(min=0.0)
+    d_true = risk_targets[:, JIRP_D_IDX].clamp(min=0.0)
+    c_loss = F.smooth_l1_loss(
+        (torch.log1p(c_pred) - risk_norm["jirp_log_c_mean"]) / risk_norm["jirp_log_c_std"],
+        (torch.log1p(c_true) - risk_norm["jirp_log_c_mean"]) / risk_norm["jirp_log_c_std"],
+    )
+    r_loss = F.smooth_l1_loss(
+        (r_pred - risk_norm["jirp_r_mean"]) / risk_norm["jirp_r_std"],
+        (r_true - risk_norm["jirp_r_mean"]) / risk_norm["jirp_r_std"],
+    )
+    d_loss = F.smooth_l1_loss(
+        (d_pred - risk_norm["jirp_d_mean"]) / risk_norm["jirp_d_std"],
+        (d_true - risk_norm["jirp_d_mean"]) / risk_norm["jirp_d_std"],
+    )
+    total = c_loss + float(cfg.jirp_metric_beta_ramp) * r_loss + float(cfg.jirp_metric_beta_duration) * d_loss
+    return total, c_loss, r_loss, d_loss
 
 
 def _ramp_event_losses(
@@ -457,8 +620,111 @@ def _build_train_sampler(cond_train: pd.DataFrame, cfg: TrainConfig) -> tuple[We
             "ramp_level_counts": {str(i): int((ramp == i).sum()) for i in range(4)},
             "duration_level_counts": {str(i): int((dur == i).sum()) for i in range(4)},
         }
+    elif mode == "jirp_profile_balanced":
+        # JIRP sampler: favor cumulative and 3h ramp risks, while only gently
+        # increasing duration to avoid over-sampling long-duration profiles.
+        cum = pd.to_numeric(cond_train["cum_level"], errors="coerce").fillna(0).clip(0, 3).to_numpy(dtype=np.float32) if "cum_level" in cond_train.columns else np.zeros((len(cond_train),), dtype=np.float32)
+        ramp = pd.to_numeric(cond_train["ramp_level"], errors="coerce").fillna(0).clip(0, 3).to_numpy(dtype=np.float32) if "ramp_level" in cond_train.columns else np.zeros((len(cond_train),), dtype=np.float32)
+        dur = pd.to_numeric(cond_train["duration_level"], errors="coerce").fillna(0).clip(0, 3).to_numpy(dtype=np.float32) if "duration_level" in cond_train.columns else np.zeros((len(cond_train),), dtype=np.float32)
+        profile = pd.to_numeric(cond_train["risk_profile_id"], errors="coerce").fillna(0).clip(0, 63).to_numpy(dtype=np.int64) if "risk_profile_id" in cond_train.columns else np.zeros((len(cond_train),), dtype=np.int64)
+        weights_np = (
+            1.0
+            + float(cfg.jirp_cum_alpha) * cum
+            + float(cfg.jirp_ramp_alpha) * ramp
+            + float(cfg.jirp_duration_alpha) * dur
+        )
+        duration_balance_events: list[dict[str, float | int]] = []
+        if cfg.jirp_duration_balance:
+            for level in range(4):
+                group = cum == float(level)
+                if group.sum() <= 1:
+                    continue
+                dur3 = group & (dur >= 3.0)
+                raw_ratio = float(dur3.sum() / max(group.sum(), 1))
+                expected_ratio = float(weights_np[dur3].sum() / max(weights_np[group].sum(), 1e-6))
+                allowed_ratio = min(1.0, raw_ratio * 1.15 + 1e-6)
+                if raw_ratio > 0 and expected_ratio > allowed_ratio:
+                    factor = max(0.50, allowed_ratio / max(expected_ratio, 1e-6))
+                    weights_np[dur3] *= factor
+                    duration_balance_events.append(
+                        {
+                            "cum_level": int(level),
+                            "raw_duration3_ratio": raw_ratio,
+                            "expected_duration3_ratio_before": expected_ratio,
+                            "duration3_weight_factor": float(factor),
+                        }
+                    )
+        weight_sum = float(np.clip(weights_np, 1e-6, None).sum())
+        config = {
+            "jirp_cum_alpha": float(cfg.jirp_cum_alpha),
+            "jirp_ramp_alpha": float(cfg.jirp_ramp_alpha),
+            "jirp_duration_alpha": float(cfg.jirp_duration_alpha),
+            "jirp_duration_balance": bool(cfg.jirp_duration_balance),
+            "duration_balance_events": duration_balance_events,
+            "cum_level_counts": {str(i): int((cum == i).sum()) for i in range(4)},
+            "ramp_level_counts": {str(i): int((ramp == i).sum()) for i in range(4)},
+            "duration_level_counts": {str(i): int((dur == i).sum()) for i in range(4)},
+            "risk_profile_id_counts": {str(int(k)): int(v) for k, v in pd.Series(profile).value_counts().sort_index().items()},
+            "expected_cum_level_sample_counts": {str(i): float(len(cond_train) * weights_np[cum == i].sum() / max(weight_sum, 1e-6)) for i in range(4)},
+            "expected_ramp_level_sample_counts": {str(i): float(len(cond_train) * weights_np[ramp == i].sum() / max(weight_sum, 1e-6)) for i in range(4)},
+            "expected_duration_level_sample_counts": {str(i): float(len(cond_train) * weights_np[dur == i].sum() / max(weight_sum, 1e-6)) for i in range(4)},
+        }
+    elif mode == "hybrid_jirp_profile_balanced":
+        # Hybrid JIRP-v2 sampler: protect old tail_score high samples for q99,
+        # add coverage of high C/R profiles, and gently balance long duration.
+        old_rank = pd.to_numeric(cond_train["old_tail_score_rank"], errors="coerce").fillna(0.0).clip(0.0, 1.0).to_numpy(dtype=np.float32) if "old_tail_score_rank" in cond_train.columns else np.zeros((len(cond_train),), dtype=np.float32)
+        c_level = pd.to_numeric(cond_train["jirp_cum_level"], errors="coerce").fillna(0).clip(0, 3).to_numpy(dtype=np.float32) if "jirp_cum_level" in cond_train.columns else np.zeros((len(cond_train),), dtype=np.float32)
+        r_level = pd.to_numeric(cond_train["jirp_ramp_level"], errors="coerce").fillna(0).clip(0, 3).to_numpy(dtype=np.float32) if "jirp_ramp_level" in cond_train.columns else np.zeros((len(cond_train),), dtype=np.float32)
+        d_level = pd.to_numeric(cond_train["jirp_duration_level"], errors="coerce").fillna(0).clip(0, 3).to_numpy(dtype=np.float32) if "jirp_duration_level" in cond_train.columns else np.zeros((len(cond_train),), dtype=np.float32)
+        profile = pd.to_numeric(cond_train["jirp_profile_id"], errors="coerce").fillna(0).clip(0, 63).to_numpy(dtype=np.int64) if "jirp_profile_id" in cond_train.columns else np.zeros((len(cond_train),), dtype=np.int64)
+        weights_np = (
+            1.0
+            + float(cfg.hybrid_sampler_old_tail_alpha) * old_rank
+            + float(cfg.hybrid_sampler_cum_alpha) * c_level
+            + float(cfg.hybrid_sampler_ramp_alpha) * r_level
+            + float(cfg.hybrid_sampler_duration_alpha) * d_level
+        )
+        duration_balance_events: list[dict[str, float | int]] = []
+        if cfg.hybrid_sampler_duration_balance:
+            for level in range(4):
+                group = c_level == float(level)
+                if group.sum() <= 1:
+                    continue
+                dur3 = group & (d_level >= 3.0)
+                raw_ratio = float(dur3.sum() / max(group.sum(), 1))
+                expected_ratio = float(weights_np[dur3].sum() / max(weights_np[group].sum(), 1e-6))
+                allowed_ratio = min(1.0, raw_ratio * 1.15 + 1e-6)
+                if raw_ratio > 0 and expected_ratio > allowed_ratio:
+                    factor = max(0.50, allowed_ratio / max(expected_ratio, 1e-6))
+                    weights_np[dur3] *= factor
+                    duration_balance_events.append(
+                        {
+                            "jirp_cum_level": int(level),
+                            "raw_duration3_ratio": raw_ratio,
+                            "expected_duration3_ratio_before": expected_ratio,
+                            "duration3_weight_factor": float(factor),
+                        }
+                    )
+        weight_sum = float(np.clip(weights_np, 1e-6, None).sum())
+        quantiles = np.quantile(old_rank, [0.0, 0.25, 0.50, 0.75, 0.90, 1.0]).tolist() if len(old_rank) else []
+        config = {
+            "hybrid_sampler_old_tail_alpha": float(cfg.hybrid_sampler_old_tail_alpha),
+            "hybrid_sampler_cum_alpha": float(cfg.hybrid_sampler_cum_alpha),
+            "hybrid_sampler_ramp_alpha": float(cfg.hybrid_sampler_ramp_alpha),
+            "hybrid_sampler_duration_alpha": float(cfg.hybrid_sampler_duration_alpha),
+            "hybrid_sampler_duration_balance": bool(cfg.hybrid_sampler_duration_balance),
+            "duration_balance_events": duration_balance_events,
+            "old_tail_score_rank_quantiles": [float(v) for v in quantiles],
+            "jirp_cum_level_counts": {str(i): int((c_level == i).sum()) for i in range(4)},
+            "jirp_ramp_level_counts": {str(i): int((r_level == i).sum()) for i in range(4)},
+            "jirp_duration_level_counts": {str(i): int((d_level == i).sum()) for i in range(4)},
+            "jirp_profile_id_counts": {str(int(k)): int(v) for k, v in pd.Series(profile).value_counts().sort_index().items()},
+            "expected_jirp_cum_level_sample_counts": {str(i): float(len(cond_train) * weights_np[c_level == i].sum() / max(weight_sum, 1e-6)) for i in range(4)},
+            "expected_jirp_ramp_level_sample_counts": {str(i): float(len(cond_train) * weights_np[r_level == i].sum() / max(weight_sum, 1e-6)) for i in range(4)},
+            "expected_jirp_duration_level_sample_counts": {str(i): float(len(cond_train) * weights_np[d_level == i].sum() / max(weight_sum, 1e-6)) for i in range(4)},
+        }
     else:
-        raise ValueError("sampler_mode must be one of {'none', 'severity', 'tail_score', 'risk_profile_balanced'}.")
+        raise ValueError("sampler_mode must be one of {'none', 'severity', 'tail_score', 'risk_profile_balanced', 'jirp_profile_balanced', 'hybrid_jirp_profile_balanced'}.")
 
     weights_np = np.asarray(weights_np, dtype=np.float32)
     weights_np = np.clip(weights_np, 1e-6, None)
@@ -516,12 +782,17 @@ def _forward_loss(
     stage: str,
     train_mode: bool,
     profile_head: RiskProfileHead | None = None,
+    jirp_profile_head: RiskProfileHead | None = None,
 ) -> dict[str, torch.Tensor]:
-    if len(batch) == 7:
+    if len(batch) == 8:
+        x, bg_cond, proc_cond, risk_cond, risk_targets, day_mask, event_mask, profile_cond = batch
+    elif len(batch) == 7:
         x, bg_cond, proc_cond, risk_cond, risk_targets, day_mask, event_mask = batch
+        profile_cond = None
     else:
         x, bg_cond, proc_cond, risk_cond, risk_targets, day_mask = batch
         event_mask = None
+        profile_cond = None
     x = x.to(device)
     bg_cond = bg_cond.to(device)
     proc_cond = proc_cond.to(device)
@@ -529,24 +800,35 @@ def _forward_loss(
     risk_targets = risk_targets.to(device)
     day_mask = day_mask.to(device)
     event_mask = event_mask.to(device) if event_mask is not None else torch.ones((x.size(0), x.size(2)), device=device)
+    profile_cond = profile_cond.to(device) if profile_cond is not None else None
 
     if train_mode:
         bg_in, proc_in, risk_in = condition_dropout(bg_cond, proc_cond, risk_cond, cfg.cond_dropout)
+        profile_in = profile_cond
+        if profile_in is not None and cfg.cond_dropout > 0:
+            keep_mask = (torch.rand(profile_in.size(0), device=device) > cfg.cond_dropout).float().view(-1, 1, 1)
+            profile_in = profile_in * keep_mask
         if cfg.use_mask_condition and cfg.mask_condition_dropout > 0 and risk_in.shape[1] >= cfg.mask_condition_dim + 3:
             keep_mask = (torch.rand(risk_in.size(0), device=device) > float(cfg.mask_condition_dropout)).float().view(-1, 1)
             risk_in = risk_in.clone()
             risk_in[:, -int(cfg.mask_condition_dim):] *= keep_mask
     else:
         bg_in, proc_in, risk_in = bg_cond, proc_cond, risk_cond
+        profile_in = profile_cond
 
     t = torch.randint(0, cfg.diffusion_steps, (x.size(0),), device=device)
     noise = torch.randn_like(x)
     x_t = scheduler.q_sample(x, t, noise)
-    pred_noise = model(x_t, t, bg_in, proc_in, risk_in)
+    pred_noise = model(x_t, t, bg_in, proc_in, risk_in, profile_in if cfg.use_joint_profile_condition else None)
 
     per_sample_mse = ((pred_noise - noise) ** 2).mean(dim=(1, 2))
     eps_loss = per_sample_mse.mean()
-    weights = tail_weight(risk_cond, cfg)
+    if cfg.use_hybrid_jirp_tail_score and stage == "stage2_tail":
+        weights = hybrid_jirp_tail_weight(risk_targets, cfg)
+    elif cfg.use_jirp_tail_score and stage == "stage2_tail":
+        weights = jirp_tail_weight(risk_targets, cfg)
+    else:
+        weights = tail_weight(risk_cond, cfg)
     tail_loss = ((weights - 1.0) * per_sample_mse).mean()
     tail_weight_mean = weights.mean()
 
@@ -643,6 +925,13 @@ def _forward_loss(
         highrisk_only=bool(cfg.shape_highrisk_only),
     )
     profile_loss = _profile_consistency_loss(profile_head, x_proj, risk_targets)
+    jirp_profile_loss = _jirp_profile_consistency_loss(jirp_profile_head, x_proj, risk_targets)
+    jirp_metric_loss, jirp_c_loss, jirp_r_loss, jirp_d_loss = _jirp_metric_consistency_loss(
+        x_proj=x_proj,
+        risk_targets=risk_targets,
+        risk_norm=risk_norm,
+        cfg=cfg,
+    )
     ramp_event_loss, ramp_event_delta_loss, ramp_event_peak_time_loss, ramp_event_peak_value_loss = _ramp_event_losses(
         x_proj=x_proj,
         x_true=x_true,
@@ -650,6 +939,29 @@ def _forward_loss(
         risk_norm=risk_norm,
         cfg=cfg,
     )
+    profile_zero = x_proj.new_tensor(0.0)
+    joint_profile_loss = profile_zero
+    joint_profile_d_loss = profile_zero
+    joint_profile_r_loss = profile_zero
+    joint_profile_c_loss = profile_zero
+    core_share_loss = profile_zero
+    if profile_cond is not None and (cfg.use_joint_profile_condition or cfg.use_joint_profile_loss):
+        resource_thresholds = {
+            "load_high": risk_norm["profile_load_high"],
+            "wind_low": risk_norm["profile_wind_low"],
+            "solar_low": risk_norm["profile_solar_low"],
+        }
+        joint_profile_loss, joint_profile_d_loss, joint_profile_r_loss, joint_profile_c_loss, core_share_loss = joint_risk_profile_loss_torch(
+            x_proj=x_proj,
+            target_profile=profile_cond,
+            tau=risk_targets[:, 3],
+            event_mask=event_mask,
+            profile_norm=risk_norm,
+            resource_thresholds=resource_thresholds,
+            delta_t_hours=cfg.delta_t_hours,
+            ramp_window_hours=cfg.joint_profile_ramp_window_hours,
+            indicator_temp=cfg.joint_profile_indicator_temp,
+        )
     total_loss = (
         eps_loss
         + sw["lambda_tail"] * tail_loss
@@ -657,7 +969,12 @@ def _forward_loss(
         + sw["lambda_tail_dist"] * tail_dist_loss
         + sw["lambda_core_risk"] * core_risk_loss
         + sw["lambda_profile"] * profile_loss
+        + sw["lambda_jirp_profile"] * jirp_profile_loss
+        + sw["lambda_jirp_metric"] * jirp_metric_loss
+        + sw["lambda_jirp_level"] * jirp_profile_loss
         + sw["lambda_ramp_event"] * ramp_event_loss
+        + sw["lambda_joint_profile"] * joint_profile_loss
+        + sw["lambda_core_share"] * core_share_loss
         + sw["lambda_delta_net"] * delta_net_loss
         + sw["lambda_ramp_topk"] * ramp_topk_loss
         + sw["lambda_shape_moment"] * shape_moment_loss
@@ -683,10 +1000,20 @@ def _forward_loss(
         "core_ramp_loss": core_ramp_loss,
         "core_dur_loss": core_dur_loss,
         "profile_loss": profile_loss,
+        "jirp_profile_loss": jirp_profile_loss,
+        "jirp_metric_loss": jirp_metric_loss,
+        "jirp_c_loss": jirp_c_loss,
+        "jirp_r_loss": jirp_r_loss,
+        "jirp_d_loss": jirp_d_loss,
         "ramp_event_loss": ramp_event_loss,
         "ramp_event_delta_loss": ramp_event_delta_loss,
         "ramp_event_peak_time_loss": ramp_event_peak_time_loss,
         "ramp_event_peak_value_loss": ramp_event_peak_value_loss,
+        "joint_profile_loss": joint_profile_loss,
+        "joint_profile_d_loss": joint_profile_d_loss,
+        "joint_profile_r_loss": joint_profile_r_loss,
+        "joint_profile_c_loss": joint_profile_c_loss,
+        "core_share_loss": core_share_loss,
         "delta_net_loss": delta_net_loss,
         "ramp_topk_loss": ramp_topk_loss,
         "shape_moment_loss": shape_moment_loss,
@@ -709,13 +1036,27 @@ def evaluate(
     cfg: TrainConfig,
     stage: str,
     profile_head: RiskProfileHead | None = None,
+    jirp_profile_head: RiskProfileHead | None = None,
 ) -> dict[str, float]:
     stats: dict[str, float] = {}
     count = 0
     model.eval()
     with torch.no_grad():
         for batch in loader:
-            out = _forward_loss(model, scheduler, batch, device, x_mean_t, x_std_t, risk_norm, cfg, stage, train_mode=False, profile_head=profile_head)
+            out = _forward_loss(
+                model,
+                scheduler,
+                batch,
+                device,
+                x_mean_t,
+                x_std_t,
+                risk_norm,
+                cfg,
+                stage,
+                train_mode=False,
+                profile_head=profile_head,
+                jirp_profile_head=jirp_profile_head,
+            )
             bs = batch[0].size(0)
             count += bs
             for key, value in out.items():
@@ -756,7 +1097,7 @@ def _build_checkpoint(
         "x_mean": x_mean,
         "x_std": x_std,
         "seq_len": cfg.seq_len,
-        "cond_dims": {"background": bg_dim, "process": proc_dim, "risk": risk_dim},
+        "cond_dims": {"background": bg_dim, "process": proc_dim, "risk": risk_dim, "profile": 4 if cfg.use_joint_profile_condition else 0},
         "flat_condition": flat_condition,
         "checkpoint_type": checkpoint_type,
         "checkpoint_epoch": int(epoch),
@@ -861,6 +1202,20 @@ def _load_pretrain_frames(pretrain_data_dir: str | None) -> tuple[pd.DataFrame |
     return cond_train, cond_val
 
 
+def _load_optional_risk_profile(data_dir: str | Path, split: str, expected_n: int, cfg: TrainConfig, warnings: list[str]) -> np.ndarray | None:
+    if not (cfg.use_joint_profile_condition or cfg.use_joint_profile_loss):
+        return None
+    path = Path(data_dir) / f"risk_profile_{split}.npy"
+    if not path.exists():
+        warnings.append(f"risk_profile_{split}.npy is missing; joint risk-profile condition/loss is disabled for this split.")
+        return None
+    profile = np.load(path).astype(np.float32)
+    if profile.shape[0] != expected_n or profile.ndim != 3 or profile.shape[1] != 4:
+        warnings.append(f"risk_profile_{split}.npy has invalid shape {profile.shape}; expected [{expected_n}, 4, T].")
+        return None
+    return profile
+
+
 def _make_pretrain_dataset(
     pretrain_data_dir: str,
     split: str,
@@ -886,7 +1241,10 @@ def _make_pretrain_dataset(
         daylight_start_hour=cfg.daylight_start_hour,
         daylight_end_hour=cfg.daylight_end_hour,
         event_mask=None,
+        risk_profile=None,
         use_risk_profile_condition=cfg.use_risk_profile_condition,
+        use_jirp_v2_condition=cfg.use_jirp_v2_condition,
+        use_jirp_continuous_values=cfg.use_jirp_continuous_values,
         use_mask_condition=cfg.use_mask_condition,
         use_ramp_event_condition=cfg.use_ramp_event_condition,
         ramp_event_condition_scale=cfg.ramp_event_condition_scale,
@@ -913,6 +1271,11 @@ def train_model(cfg: TrainConfig) -> dict:
     warnings: list[str] = []
     x_train, cond_train, meta_train, train_event_mask, augmentation_summary = _load_training_arrays(cfg, warnings)
     x_val, cond_val, meta_val, val_event_mask = load_split_arrays(cfg.data_dir, "val", include_event_mask=True)
+    train_risk_profile = _load_optional_risk_profile(cfg.data_dir, "train", len(x_train), cfg, warnings)
+    val_risk_profile = _load_optional_risk_profile(cfg.data_dir, "val", len(x_val), cfg, warnings)
+    if (cfg.use_joint_profile_condition or cfg.use_joint_profile_loss) and (train_risk_profile is None or val_risk_profile is None):
+        cfg = TrainConfig(**{**asdict(cfg), "use_joint_profile_condition": False, "use_joint_profile_loss": False})
+        warnings.append("Joint risk-profile sequence condition/loss disabled because profile arrays are unavailable.")
     pretrain_frame_dir = cfg.pretrain_data_dir if (cfg.use_pretrain or cfg.stage0_epochs > 0) else None
     pretrain_cond_train, pretrain_cond_val = _load_pretrain_frames(pretrain_frame_dir)
     if cfg.use_pretrain and cfg.stage0_epochs > 0 and pretrain_cond_train is None:
@@ -940,7 +1303,10 @@ def train_model(cfg: TrainConfig) -> dict:
         daylight_start_hour=cfg.daylight_start_hour,
         daylight_end_hour=cfg.daylight_end_hour,
         event_mask=train_event_mask,
+        risk_profile=train_risk_profile,
         use_risk_profile_condition=cfg.use_risk_profile_condition,
+        use_jirp_v2_condition=cfg.use_jirp_v2_condition,
+        use_jirp_continuous_values=cfg.use_jirp_continuous_values,
         use_mask_condition=cfg.use_mask_condition,
         use_ramp_event_condition=cfg.use_ramp_event_condition,
         ramp_event_condition_scale=cfg.ramp_event_condition_scale,
@@ -956,7 +1322,10 @@ def train_model(cfg: TrainConfig) -> dict:
         daylight_start_hour=cfg.daylight_start_hour,
         daylight_end_hour=cfg.daylight_end_hour,
         event_mask=val_event_mask,
+        risk_profile=val_risk_profile,
         use_risk_profile_condition=cfg.use_risk_profile_condition,
+        use_jirp_v2_condition=cfg.use_jirp_v2_condition,
+        use_jirp_continuous_values=cfg.use_jirp_continuous_values,
         use_mask_condition=cfg.use_mask_condition,
         use_ramp_event_condition=cfg.use_ramp_event_condition,
         ramp_event_condition_scale=cfg.ramp_event_condition_scale,
@@ -981,6 +1350,55 @@ def train_model(cfg: TrainConfig) -> dict:
         "dur_mean": np.float32(cond_train["imbalance_duration"].astype(float).to_numpy().mean()),
         "dur_std": np.float32(cond_train["imbalance_duration"].astype(float).to_numpy().std() + 1e-6),
     }
+    jirp_c = cond_train["jirp_cum_intensity"].astype(float).to_numpy() if "jirp_cum_intensity" in cond_train.columns else cond_train["cum_deficit"].astype(float).to_numpy()
+    jirp_r = cond_train["jirp_ramp_tail_intensity"].astype(float).to_numpy() if "jirp_ramp_tail_intensity" in cond_train.columns else cond_train["netload_ramp_max"].astype(float).to_numpy()
+    jirp_d = cond_train["jirp_duration"].astype(float).to_numpy() if "jirp_duration" in cond_train.columns else cond_train["imbalance_duration"].astype(float).to_numpy()
+    risk_norm_np.update(
+        {
+            "jirp_log_c_mean": np.float32(np.log1p(jirp_c).mean()),
+            "jirp_log_c_std": np.float32(np.log1p(jirp_c).std() + 1e-6),
+            "jirp_r_mean": np.float32(jirp_r.mean()),
+            "jirp_r_std": np.float32(jirp_r.std() + 1e-6),
+            "jirp_d_mean": np.float32(jirp_d.mean()),
+            "jirp_d_std": np.float32(jirp_d.std() + 1e-6),
+        }
+    )
+    if train_risk_profile is not None:
+        risk_norm_np.update(
+            {
+                "profile_d_mean": np.float32(train_risk_profile[:, 0, :].mean()),
+                "profile_d_std": np.float32(train_risk_profile[:, 0, :].std() + 1e-6),
+                "profile_r_mean": np.float32(train_risk_profile[:, 1, :].mean()),
+                "profile_r_std": np.float32(train_risk_profile[:, 1, :].std() + 1e-6),
+                "profile_c_mean": np.float32(train_risk_profile[:, 2, :].mean()),
+                "profile_c_std": np.float32(train_risk_profile[:, 2, :].std() + 1e-6),
+            }
+        )
+    else:
+        risk_norm_np.update(
+            {
+                "profile_d_mean": np.float32(0.0),
+                "profile_d_std": np.float32(1.0),
+                "profile_r_mean": np.float32(0.0),
+                "profile_r_std": np.float32(1.0),
+                "profile_c_mean": np.float32(0.0),
+                "profile_c_std": np.float32(1.0),
+            }
+        )
+    profile_cfg_path = Path(cfg.data_dir) / "joint_risk_profile_config.json"
+    profile_thresholds = {}
+    if profile_cfg_path.exists():
+        try:
+            profile_thresholds = json.loads(profile_cfg_path.read_text(encoding="utf-8-sig")).get("resource_thresholds", {})
+        except Exception:
+            warnings.append(f"Could not parse joint risk profile config: {profile_cfg_path}")
+    risk_norm_np.update(
+        {
+            "profile_load_high": np.float32(profile_thresholds.get("load_high", np.quantile(x_train[:, 0, :], 0.75))),
+            "profile_wind_low": np.float32(profile_thresholds.get("wind_low", np.quantile(x_train[:, 1, :], 0.25))),
+            "profile_solar_low": np.float32(profile_thresholds.get("solar_low", np.quantile(x_train[:, 2, :], 0.25))),
+        }
+    )
     x_mean_t = torch.from_numpy(x_mean).to(device)
     x_std_t = torch.from_numpy(x_std).to(device)
     risk_norm_t = {k: torch.tensor(v, dtype=torch.float32, device=device) for k, v in risk_norm_np.items()}
@@ -989,6 +1407,7 @@ def train_model(cfg: TrainConfig) -> dict:
     bg_dim = train_ds.background.shape[1]
     proc_dim = train_ds.process.shape[1]
     risk_dim = train_ds.risk.shape[1]
+    profile_channels = 4 if cfg.use_joint_profile_condition else 0
     model = HierarchicalConditionalUNet1D(
         in_channels=cfg.in_channels,
         base_channels=cfg.base_channels,
@@ -998,6 +1417,7 @@ def train_model(cfg: TrainConfig) -> dict:
         proc_dim=proc_dim,
         risk_dim=risk_dim,
         flat_condition=flat_condition,
+        profile_channels=profile_channels,
     ).to(device)
     ema_model = HierarchicalConditionalUNet1D(
         in_channels=cfg.in_channels,
@@ -1008,11 +1428,21 @@ def train_model(cfg: TrainConfig) -> dict:
         proc_dim=proc_dim,
         risk_dim=risk_dim,
         flat_condition=flat_condition,
+        profile_channels=profile_channels,
     ).to(device)
     ema_model.load_state_dict(model.state_dict())
     ema = EMA(model, cfg.ema_decay)
     scheduler = DiffusionScheduler(cfg.diffusion_steps, cfg.beta_start, cfg.beta_end, device=device).to(device)
-    profile_head = RiskProfileHead(in_channels=cfg.in_channels).to(device) if (cfg.use_profile_loss and cfg.lambda_profile > 0) else None
+    profile_head = (
+        RiskProfileHead(in_channels=cfg.in_channels).to(device)
+        if (cfg.use_profile_loss and (cfg.lambda_profile > 0 or cfg.lambda_profile_stage2 > 0))
+        else None
+    )
+    jirp_profile_head = (
+        RiskProfileHead(in_channels=cfg.in_channels).to(device)
+        if (cfg.lambda_jirp_profile_stage2 > 0 or cfg.lambda_jirp_level > 0)
+        else None
+    )
 
     pretrain_summary: dict | None = None
     frozen_blocks: list[str] = []
@@ -1080,6 +1510,7 @@ def train_model(cfg: TrainConfig) -> dict:
                     "stage0_pretrain",
                     train_mode=True,
                     profile_head=None,
+                    jirp_profile_head=None,
                 )
                 pretrain_optimizer.zero_grad()
                 out["total_loss"].backward()
@@ -1103,6 +1534,7 @@ def train_model(cfg: TrainConfig) -> dict:
                 cfg,
                 "stage0_pretrain",
                 profile_head=None,
+                jirp_profile_head=None,
             )
             val_stats = {f"val_{key}": value for key, value in val_stats_raw.items()}
             row = {"epoch": pre_epoch, "stage": "stage0_pretrain"}
@@ -1178,6 +1610,8 @@ def train_model(cfg: TrainConfig) -> dict:
     trainable_params = list(p for p in model.parameters() if p.requires_grad)
     if profile_head is not None:
         trainable_params.extend(profile_head.parameters())
+    if jirp_profile_head is not None:
+        trainable_params.extend(jirp_profile_head.parameters())
     optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=cfg.weight_decay)
     ema_model.load_state_dict(model.state_dict())
     ema = EMA(model, cfg.ema_decay)
@@ -1198,11 +1632,26 @@ def train_model(cfg: TrainConfig) -> dict:
         model.train()
         if profile_head is not None:
             profile_head.train()
+        if jirp_profile_head is not None:
+            jirp_profile_head.train()
         epoch_stats: dict[str, float] = {}
         count = 0
 
         for batch in train_loader:
-            out = _forward_loss(model, scheduler, batch, device, x_mean_t, x_std_t, risk_norm_t, cfg, stage, train_mode=True, profile_head=profile_head)
+            out = _forward_loss(
+                model,
+                scheduler,
+                batch,
+                device,
+                x_mean_t,
+                x_std_t,
+                risk_norm_t,
+                cfg,
+                stage,
+                train_mode=True,
+                profile_head=profile_head,
+                jirp_profile_head=jirp_profile_head,
+            )
             optimizer.zero_grad()
             out["total_loss"].backward()
             nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
@@ -1218,7 +1667,21 @@ def train_model(cfg: TrainConfig) -> dict:
         ema.copy_to(ema_model)
         if profile_head is not None:
             profile_head.eval()
-        val_stats_raw = evaluate(ema_model, scheduler, val_loader, device, x_mean_t, x_std_t, risk_norm_t, cfg, stage, profile_head=profile_head)
+        if jirp_profile_head is not None:
+            jirp_profile_head.eval()
+        val_stats_raw = evaluate(
+            ema_model,
+            scheduler,
+            val_loader,
+            device,
+            x_mean_t,
+            x_std_t,
+            risk_norm_t,
+            cfg,
+            stage,
+            profile_head=profile_head,
+            jirp_profile_head=jirp_profile_head,
+        )
         val_stats = {f"val_{key}": value for key, value in val_stats_raw.items()}
 
         row = {"epoch": epoch, "stage": stage}
@@ -1303,7 +1766,7 @@ def train_model(cfg: TrainConfig) -> dict:
     torch.save(final_checkpoint, out_dir / "final_model.pt")
 
     condition_meta = dict(train_ds.condition_meta)
-    condition_meta["cond_dims"] = {"background": bg_dim, "process": proc_dim, "risk": risk_dim}
+    condition_meta["cond_dims"] = {"background": bg_dim, "process": proc_dim, "risk": risk_dim, "profile": profile_channels}
     condition_meta["flat_condition"] = flat_condition
     (out_dir / "condition_meta.json").write_text(json.dumps(condition_meta, ensure_ascii=False, indent=2), encoding="utf-8")
     np.savez(out_dir / "normalization_stats.npz", x_mean=x_mean.astype(np.float32), x_std=x_std.astype(np.float32))
@@ -1346,6 +1809,34 @@ def train_model(cfg: TrainConfig) -> dict:
         "tail_weight_mode": cfg.tail_weight_mode,
         "tail_weight_alpha": cfg.tail_weight_alpha,
         "tail_weight_max": cfg.tail_weight_max,
+        "use_jirp_tail_score": bool(cfg.use_jirp_tail_score),
+        "lambda_profile_stage2": float(cfg.lambda_profile_stage2),
+        "jirp_cum_alpha": float(cfg.jirp_cum_alpha),
+        "jirp_ramp_alpha": float(cfg.jirp_ramp_alpha),
+        "jirp_duration_alpha": float(cfg.jirp_duration_alpha),
+        "jirp_duration_balance": bool(cfg.jirp_duration_balance),
+        "use_jirp_v2_condition": bool(cfg.use_jirp_v2_condition),
+        "jirp_embed_dim": int(cfg.jirp_embed_dim),
+        "use_jirp_continuous_values": bool(cfg.use_jirp_continuous_values),
+        "use_hybrid_jirp_tail_score": bool(cfg.use_hybrid_jirp_tail_score),
+        "old_tail_weight": float(cfg.old_tail_weight),
+        "jirp_tail_weight": float(cfg.jirp_tail_weight),
+        "jirp_cum_weight": float(cfg.jirp_cum_weight),
+        "jirp_ramp_weight": float(cfg.jirp_ramp_weight),
+        "jirp_duration_weight": float(cfg.jirp_duration_weight),
+        "lambda_jirp_profile_stage2": float(cfg.lambda_jirp_profile_stage2),
+        "lambda_jirp_metric": float(cfg.lambda_jirp_metric),
+        "lambda_jirp_level": float(cfg.lambda_jirp_level),
+        "jirp_metric_beta_ramp": float(cfg.jirp_metric_beta_ramp),
+        "jirp_metric_beta_duration": float(cfg.jirp_metric_beta_duration),
+        "hybrid_sampler_old_tail_alpha": float(cfg.hybrid_sampler_old_tail_alpha),
+        "hybrid_sampler_cum_alpha": float(cfg.hybrid_sampler_cum_alpha),
+        "hybrid_sampler_ramp_alpha": float(cfg.hybrid_sampler_ramp_alpha),
+        "hybrid_sampler_duration_alpha": float(cfg.hybrid_sampler_duration_alpha),
+        "hybrid_sampler_duration_balance": bool(cfg.hybrid_sampler_duration_balance),
+        "jirp_ramp_windows": cfg.jirp_ramp_windows,
+        "jirp_ramp_topk_ratio": float(cfg.jirp_ramp_topk_ratio),
+        "jirp_ramp_definition": cfg.jirp_ramp_definition,
         "lambda_tail_dist": 0.0 if cfg.ablation == "no_risk_loss" else cfg.lambda_tail_dist,
         "tail_dist_topk_ratio": cfg.tail_dist_topk_ratio,
         "tail_dist_metric": cfg.tail_dist_metric,
@@ -1363,12 +1854,19 @@ def train_model(cfg: TrainConfig) -> dict:
         "shape_highrisk_only": cfg.shape_highrisk_only,
         "lambda_duration_over_stage3": cfg.lambda_duration_over_stage3,
         "lambda_exceed_mask_stage3": cfg.lambda_exceed_mask_stage3,
+        "use_joint_profile_condition": bool(cfg.use_joint_profile_condition),
+        "use_joint_profile_loss": bool(cfg.use_joint_profile_loss),
+        "lambda_joint_profile_stage2": float(cfg.lambda_joint_profile_stage2),
+        "lambda_joint_profile_stage3": float(cfg.lambda_joint_profile_stage3),
+        "lambda_core_share_stage3": float(cfg.lambda_core_share_stage3),
+        "joint_profile_ramp_window_hours": float(cfg.joint_profile_ramp_window_hours),
+        "joint_profile_indicator_temp": float(cfg.joint_profile_indicator_temp),
         "checkpoint_type_used_for_generation": None,
         "stage1_epochs": cfg.stage1_epochs,
         "stage2_epochs": cfg.stage2_epochs,
         "stage3_epochs": cfg.stage3_epochs,
         "flat_condition": flat_condition,
-        "condition_dims": {"background": bg_dim, "process": proc_dim, "risk": risk_dim},
+        "condition_dims": {"background": bg_dim, "process": proc_dim, "risk": risk_dim, "profile": profile_channels},
         "train_config": asdict(cfg),
         "stage_loss_policy": {
             "stage0_pretrain": "eps_loss + lambda_recon * recon_loss + lambda_physics * physics_loss on normal windows only",
@@ -1381,8 +1879,14 @@ def train_model(cfg: TrainConfig) -> dict:
             "delta_net_loss": "stage2/stage3 optional: SmoothL1 of full net-load first differences",
             "ramp_topk_loss": "stage3 optional: SmoothL1 of top-k positive net-load ramps",
             "shape_moment_loss": "stage2/stage3 optional: high-risk channel/difference moment anchor",
+            "jirp_tail_loss": "stage2 optional: tail_loss weighted by jirp_tail_score = 0.5*rank(cum_deficit) + 0.3*rank(3h ramp) + 0.2*rank(duration)",
+            "hybrid_jirp_tail_loss": "stage2 optional: hybrid_tail_score keeps old cum-deficit EVT tail anchor and adds JIRP-v2 C/R/D profile score",
+            "jirp_v2_metric_loss": "stage3 optional: normalized SmoothL1 on JIRP-v2 C cumulative imbalance, R ramp-tail intensity, and D duration",
+            "jirp_v2_level_loss": "stage3 optional: CE on JIRP-v2 C/R/D levels",
             "duration_over_loss": "stage3 optional: one-sided penalty when generated imbalance duration exceeds target duration",
             "exceed_mask_loss": "stage3 optional: BCE on hourly net-load exceedance mask relative to tau",
+            "joint_profile_loss": "stage2/stage3 optional: sequence loss on G(t) = [D(t), R3h+(t), C(t), event_mask(t)] using D/R/C channels",
+            "core_share_loss": "stage3 optional: loss on the share of exceedance depth concentrated inside event_mask core hours",
         },
         "loss_weights": {
             "lambda_tail": cfg.lambda_tail,
@@ -1401,8 +1905,28 @@ def train_model(cfg: TrainConfig) -> dict:
             "ramp_topk_ratio": cfg.ramp_topk_ratio,
             "lambda_shape_stage2": cfg.lambda_shape_stage2,
             "lambda_shape_stage3": cfg.lambda_shape_stage3,
+            "use_jirp_tail_score": bool(cfg.use_jirp_tail_score),
+            "lambda_profile_stage2": float(cfg.lambda_profile_stage2),
+            "jirp_cum_alpha": float(cfg.jirp_cum_alpha),
+            "jirp_ramp_alpha": float(cfg.jirp_ramp_alpha),
+            "jirp_duration_alpha": float(cfg.jirp_duration_alpha),
+            "jirp_duration_balance": bool(cfg.jirp_duration_balance),
+            "use_jirp_v2_condition": bool(cfg.use_jirp_v2_condition),
+            "use_hybrid_jirp_tail_score": bool(cfg.use_hybrid_jirp_tail_score),
+            "old_tail_weight": float(cfg.old_tail_weight),
+            "jirp_tail_weight": float(cfg.jirp_tail_weight),
+            "lambda_jirp_profile_stage2": float(cfg.lambda_jirp_profile_stage2),
+            "lambda_jirp_metric": float(cfg.lambda_jirp_metric),
+            "lambda_jirp_level": float(cfg.lambda_jirp_level),
             "lambda_duration_over_stage3": cfg.lambda_duration_over_stage3,
         "lambda_exceed_mask_stage3": cfg.lambda_exceed_mask_stage3,
+        "use_joint_profile_condition": bool(cfg.use_joint_profile_condition),
+        "use_joint_profile_loss": bool(cfg.use_joint_profile_loss),
+        "lambda_joint_profile_stage2": float(cfg.lambda_joint_profile_stage2),
+        "lambda_joint_profile_stage3": float(cfg.lambda_joint_profile_stage3),
+        "lambda_core_share_stage3": float(cfg.lambda_core_share_stage3),
+        "joint_profile_ramp_window_hours": float(cfg.joint_profile_ramp_window_hours),
+        "joint_profile_indicator_temp": float(cfg.joint_profile_indicator_temp),
         "use_risk_profile_condition": bool(cfg.use_risk_profile_condition),
         "risk_profile_embed_dim": int(cfg.risk_profile_embed_dim),
         "risk_profile_cum_alpha": float(cfg.risk_profile_cum_alpha),
@@ -1468,7 +1992,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--lambda-recon", type=float, default=0.05)
     parser.add_argument("--lambda-physics", type=float, default=0.02)
     parser.add_argument("--lambda-resource", type=float, default=0.02)
-    parser.add_argument("--sampler-mode", type=str, default="none", choices=["none", "severity", "tail_score", "risk_profile_balanced"])
+    parser.add_argument("--sampler-mode", type=str, default="none", choices=["none", "severity", "tail_score", "risk_profile_balanced", "jirp_profile_balanced", "hybrid_jirp_profile_balanced"])
     parser.add_argument("--severity-sample-weights", type=str, default="0:1.0,1:1.5,2:2.5,3:3.5")
     parser.add_argument("--tail-sampler-alpha", type=float, default=0.5)
     parser.add_argument("--tail-weight-mode", type=str, default="relu", choices=["relu", "sigmoid", "clipped_relu"])
@@ -1498,6 +2022,34 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--risk-profile-duration-balance", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-profile-loss", action="store_true", help="?? JRPD profile consistency auxiliary loss?")
     parser.add_argument("--lambda-profile", type=float, default=0.0)
+    parser.add_argument("--use-jirp-tail-score", action="store_true", help="Use joint imbalance risk-profile tail score in Stage 2.")
+    parser.add_argument("--lambda-profile-stage2", type=float, default=0.0)
+    parser.add_argument("--jirp-cum-alpha", type=float, default=0.5)
+    parser.add_argument("--jirp-ramp-alpha", type=float, default=0.3)
+    parser.add_argument("--jirp-duration-alpha", type=float, default=0.1)
+    parser.add_argument("--jirp-duration-balance", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-jirp-v2-condition", action="store_true")
+    parser.add_argument("--jirp-embed-dim", type=int, default=8)
+    parser.add_argument("--use-jirp-continuous-values", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-hybrid-jirp-tail-score", action="store_true")
+    parser.add_argument("--old-tail-weight", type=float, default=0.70)
+    parser.add_argument("--jirp-tail-weight", type=float, default=0.30)
+    parser.add_argument("--jirp-cum-weight", type=float, default=0.55)
+    parser.add_argument("--jirp-ramp-weight", type=float, default=0.30)
+    parser.add_argument("--jirp-duration-weight", type=float, default=0.15)
+    parser.add_argument("--lambda-jirp-profile-stage2", type=float, default=0.0)
+    parser.add_argument("--lambda-jirp-metric", type=float, default=0.0)
+    parser.add_argument("--lambda-jirp-level", type=float, default=0.0)
+    parser.add_argument("--jirp-metric-beta-ramp", type=float, default=0.5)
+    parser.add_argument("--jirp-metric-beta-duration", type=float, default=0.2)
+    parser.add_argument("--hybrid-sampler-old-tail-alpha", type=float, default=0.5)
+    parser.add_argument("--hybrid-sampler-cum-alpha", type=float, default=0.3)
+    parser.add_argument("--hybrid-sampler-ramp-alpha", type=float, default=0.3)
+    parser.add_argument("--hybrid-sampler-duration-alpha", type=float, default=0.1)
+    parser.add_argument("--hybrid-sampler-duration-balance", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--jirp-ramp-windows", type=str, default="1.0,2.0,3.0")
+    parser.add_argument("--jirp-ramp-topk-ratio", type=float, default=0.10)
+    parser.add_argument("--jirp-ramp-definition", type=str, default="multiscale_topk_mean", choices=["multiscale_topk_mean", "multiscale_max"])
     parser.add_argument("--use-mask-prior", action="store_true", help="???? MaskPrior-Diffusion?")
     parser.add_argument("--lambda-mask-prior", type=float, default=0.0)
     parser.add_argument("--use-mask-condition", action="store_true", help="? mask prior ???????????")
@@ -1516,6 +2068,13 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--use-ramp-event-loss", action="store_true", help="?? ramp event consistency loss?")
     parser.add_argument("--lambda-ramp-event", type=float, default=0.0)
     parser.add_argument("--ramp-peak-softmax-temp", type=float, default=0.2)
+    parser.add_argument("--use-joint-profile-condition", action="store_true")
+    parser.add_argument("--use-joint-profile-loss", action="store_true")
+    parser.add_argument("--lambda-joint-profile-stage2", type=float, default=0.0)
+    parser.add_argument("--lambda-joint-profile-stage3", type=float, default=0.0)
+    parser.add_argument("--lambda-core-share-stage3", type=float, default=0.0)
+    parser.add_argument("--joint-profile-ramp-window-hours", type=float, default=3.0)
+    parser.add_argument("--joint-profile-indicator-temp", type=float, default=0.2)
     parser.add_argument("--ramp-metric-mode", type=str, default="one_step", choices=["one_step", "window_1h", "window_2h", "window_3h", "multiscale"])
     parser.add_argument("--ramp-window-hours", type=float, default=1.0)
     parser.add_argument("--multiscale-ramp-windows", type=str, default="1.0,2.0,3.0")
@@ -1590,6 +2149,34 @@ def parse_args() -> TrainConfig:
         risk_profile_duration_balance=args.risk_profile_duration_balance,
         use_profile_loss=args.use_profile_loss,
         lambda_profile=args.lambda_profile,
+        use_jirp_tail_score=args.use_jirp_tail_score,
+        lambda_profile_stage2=args.lambda_profile_stage2,
+        jirp_cum_alpha=args.jirp_cum_alpha,
+        jirp_ramp_alpha=args.jirp_ramp_alpha,
+        jirp_duration_alpha=args.jirp_duration_alpha,
+        jirp_duration_balance=args.jirp_duration_balance,
+        use_jirp_v2_condition=args.use_jirp_v2_condition,
+        jirp_embed_dim=args.jirp_embed_dim,
+        use_jirp_continuous_values=args.use_jirp_continuous_values,
+        use_hybrid_jirp_tail_score=args.use_hybrid_jirp_tail_score,
+        old_tail_weight=args.old_tail_weight,
+        jirp_tail_weight=args.jirp_tail_weight,
+        jirp_cum_weight=args.jirp_cum_weight,
+        jirp_ramp_weight=args.jirp_ramp_weight,
+        jirp_duration_weight=args.jirp_duration_weight,
+        lambda_jirp_profile_stage2=args.lambda_jirp_profile_stage2,
+        lambda_jirp_metric=args.lambda_jirp_metric,
+        lambda_jirp_level=args.lambda_jirp_level,
+        jirp_metric_beta_ramp=args.jirp_metric_beta_ramp,
+        jirp_metric_beta_duration=args.jirp_metric_beta_duration,
+        hybrid_sampler_old_tail_alpha=args.hybrid_sampler_old_tail_alpha,
+        hybrid_sampler_cum_alpha=args.hybrid_sampler_cum_alpha,
+        hybrid_sampler_ramp_alpha=args.hybrid_sampler_ramp_alpha,
+        hybrid_sampler_duration_alpha=args.hybrid_sampler_duration_alpha,
+        hybrid_sampler_duration_balance=args.hybrid_sampler_duration_balance,
+        jirp_ramp_windows=args.jirp_ramp_windows,
+        jirp_ramp_topk_ratio=args.jirp_ramp_topk_ratio,
+        jirp_ramp_definition=args.jirp_ramp_definition,
         use_mask_prior=args.use_mask_prior,
         lambda_mask_prior=args.lambda_mask_prior,
         use_mask_condition=args.use_mask_condition,
@@ -1608,6 +2195,13 @@ def parse_args() -> TrainConfig:
         use_ramp_event_loss=args.use_ramp_event_loss,
         lambda_ramp_event=args.lambda_ramp_event,
         ramp_peak_softmax_temp=args.ramp_peak_softmax_temp,
+        use_joint_profile_condition=args.use_joint_profile_condition,
+        use_joint_profile_loss=args.use_joint_profile_loss,
+        lambda_joint_profile_stage2=args.lambda_joint_profile_stage2,
+        lambda_joint_profile_stage3=args.lambda_joint_profile_stage3,
+        lambda_core_share_stage3=args.lambda_core_share_stage3,
+        joint_profile_ramp_window_hours=args.joint_profile_ramp_window_hours,
+        joint_profile_indicator_temp=args.joint_profile_indicator_temp,
         ramp_metric_mode=args.ramp_metric_mode,
         ramp_window_hours=args.ramp_window_hours,
         multiscale_ramp_windows=args.multiscale_ramp_windows,

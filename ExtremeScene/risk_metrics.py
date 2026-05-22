@@ -219,6 +219,213 @@ def compute_multiscale_netload_ramp(
     return ramps
 
 
+def compute_jirp_ramp_tail_intensity(
+    x: np.ndarray,
+    delta_t_hours: float = 1.0,
+    ramp_windows: list[float] | tuple[float, ...] = (1.0, 2.0, 3.0),
+    topk_ratio: float = 0.10,
+    definition: str = "multiscale_topk_mean",
+) -> np.ndarray | float:
+    """Compute JIRP-v2 burst-regulation intensity R.
+
+    x 是风光荷序列，形状为 [N, 3, T] 或 [3, T]；通道顺序为
+    load、wind_power、solar_power。net_load 为净负荷，等于负荷减去风电和
+    光伏出力。jirp_ramp_tail_intensity 将 1h/2h/3h 正向净负荷爬坡合并后
+    取尾部 top-k 均值，用于刻画中短时突发调节压力。
+    """
+
+    arr = np.asarray(x, dtype=float)
+    single = False
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+        single = True
+    if arr.ndim != 3 or arr.shape[1] != 3:
+        raise ValueError("Expected x with shape [N, 3, T] or [3, T].")
+    if delta_t_hours <= 0:
+        raise ValueError("delta_t_hours must be positive.")
+    net_load = arr[:, 0, :] - arr[:, 1, :] - arr[:, 2, :]
+    per_window_max = []
+    per_sample_values: list[list[np.ndarray]] = [[] for _ in range(arr.shape[0])]
+    for window in ramp_windows:
+        steps = max(1, int(round(float(window) / float(delta_t_hours))))
+        if steps >= arr.shape[2]:
+            continue
+        ramp = np.maximum(net_load[:, steps:] - net_load[:, :-steps], 0.0)
+        per_window_max.append(np.nanmax(ramp, axis=1))
+        for i in range(arr.shape[0]):
+            per_sample_values[i].append(ramp[i])
+    mode = str(definition).strip().lower()
+    if mode == "multiscale_max":
+        if not per_window_max:
+            out = np.zeros((arr.shape[0],), dtype=float)
+        else:
+            out = np.nanmax(np.vstack(per_window_max), axis=0).astype(float)
+    elif mode == "multiscale_topk_mean":
+        out_values = []
+        for values in per_sample_values:
+            merged = np.concatenate(values) if values else np.zeros((1,), dtype=float)
+            if merged.size == 0:
+                out_values.append(0.0)
+                continue
+            k = max(1, int(np.ceil(float(topk_ratio) * merged.size)))
+            topk = np.partition(merged, -k)[-k:]
+            out_values.append(float(np.mean(topk)))
+        out = np.asarray(out_values, dtype=float)
+    else:
+        raise ValueError("definition must be 'multiscale_topk_mean' or 'multiscale_max'.")
+    return float(out[0]) if single else out
+
+
+def batch_jirp_v2_metrics(
+    x: np.ndarray,
+    tau: np.ndarray | float,
+    delta_t_hours: float = 1.0,
+    ramp_windows: list[float] | tuple[float, ...] = (1.0, 2.0, 3.0),
+    topk_ratio: float = 0.10,
+    ramp_definition: str = "multiscale_topk_mean",
+) -> dict[str, np.ndarray]:
+    """Compute JIRP-v2 C/R/D metrics for a batch.
+
+    C 为累计失衡强度，R 为突发调节强度，D 为持续影响程度。tau 为失衡
+    阈值，只使用样本自身 cond 中的 imbalance_tau，不使用测试真实曲线以外
+    的额外信息。
+    """
+
+    arr = np.asarray(x, dtype=float)
+    if arr.ndim != 3 or arr.shape[1] != 3:
+        raise ValueError("Expected x with shape [N, 3, T].")
+    tau_arr = np.asarray(tau, dtype=float)
+    if tau_arr.ndim == 0:
+        tau_arr = np.full((arr.shape[0],), float(tau_arr), dtype=float)
+    net_load = arr[:, 0, :] - arr[:, 1, :] - arr[:, 2, :]
+    excess = np.maximum(net_load - tau_arr[:, None], 0.0)
+    c = excess.sum(axis=1) * float(delta_t_hours)
+    r = compute_jirp_ramp_tail_intensity(
+        arr,
+        delta_t_hours=delta_t_hours,
+        ramp_windows=ramp_windows,
+        topk_ratio=topk_ratio,
+        definition=ramp_definition,
+    )
+    d = (net_load > tau_arr[:, None]).sum(axis=1) * float(delta_t_hours)
+    return {
+        "jirp_cum_intensity": np.asarray(c, dtype=float),
+        "jirp_ramp_tail_intensity": np.asarray(r, dtype=float),
+        "jirp_duration": np.asarray(d, dtype=float),
+    }
+
+
+def batch_joint_risk_profile(
+    x: np.ndarray,
+    tau: np.ndarray | float,
+    event_mask: np.ndarray | None = None,
+    delta_t_hours: float = 1.0,
+    ramp_window_hours: float = 3.0,
+    resource_thresholds: dict[str, float] | None = None,
+) -> np.ndarray:
+    """Build the joint risk profile G with shape [N, 4, T].
+
+    G contains:
+    - D(t): net-load exceedance depth, cumulative imbalance pressure.
+    - R3h+(t): positive 3h net-load ramp, medium-short-term regulation pressure.
+    - C(t): synchronized adverse resource state, high load + low wind + low solar.
+    - event_mask(t): core major-weather-event period.
+    """
+
+    arr = np.asarray(x, dtype=float)
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+    if arr.ndim != 3 or arr.shape[1] != 3:
+        raise ValueError("Expected x with shape [N, 3, T] or [3, T].")
+    n, _, seq_len = arr.shape
+    tau_arr = np.asarray(tau, dtype=float)
+    if tau_arr.ndim == 0:
+        tau_arr = np.full((n,), float(tau_arr), dtype=float)
+    tau_arr = tau_arr.reshape(-1)
+    if tau_arr.size == 1:
+        tau_arr = np.full((n,), float(tau_arr[0]), dtype=float)
+
+    net_load = arr[:, 0, :] - arr[:, 1, :] - arr[:, 2, :]
+    depth = np.maximum(net_load - tau_arr[:, None], 0.0) * float(delta_t_hours)
+    steps = max(1, int(round(float(ramp_window_hours) / max(float(delta_t_hours), 1e-6))))
+    ramp = np.zeros((n, seq_len), dtype=float)
+    if steps < seq_len:
+        ramp[:, steps:] = np.maximum(net_load[:, steps:] - net_load[:, :-steps], 0.0)
+
+    thresholds = resource_thresholds or {}
+    load_high = float(thresholds.get("load_high", np.quantile(arr[:, 0, :], 0.75)))
+    wind_low = float(thresholds.get("wind_low", np.quantile(arr[:, 1, :], 0.25)))
+    solar_low = float(thresholds.get("solar_low", np.quantile(arr[:, 2, :], 0.25)))
+    sync = (
+        (arr[:, 0, :] >= load_high).astype(float)
+        + (arr[:, 1, :] <= wind_low).astype(float)
+        + (arr[:, 2, :] <= solar_low).astype(float)
+    )
+
+    if event_mask is None:
+        mask = np.ones((n, seq_len), dtype=float)
+    else:
+        mask = np.asarray(event_mask, dtype=float)
+        if mask.shape != (n, seq_len):
+            raise ValueError(f"Expected event_mask with shape {(n, seq_len)}, got {mask.shape}.")
+    return np.stack([depth, ramp, sync, mask], axis=1).astype(np.float32)
+
+
+def joint_risk_profile_loss_torch(
+    x_proj: torch.Tensor,
+    target_profile: torch.Tensor,
+    tau: torch.Tensor,
+    event_mask: torch.Tensor,
+    profile_norm: dict[str, torch.Tensor],
+    resource_thresholds: dict[str, torch.Tensor],
+    delta_t_hours: float = 1.0,
+    ramp_window_hours: float = 3.0,
+    indicator_temp: float = 0.2,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Differentiable joint risk profile loss.
+
+    The profile compares D(t), R3h+(t), and C(t). event_mask(t) is used as
+    weather-process alignment information and for core-risk concentration.
+    """
+
+    if target_profile is None or target_profile.numel() == 0:
+        zero = x_proj.new_tensor(0.0)
+        return zero, zero, zero, zero, zero
+    net_load = x_proj[:, 0, :] - x_proj[:, 1, :] - x_proj[:, 2, :]
+    tau = tau.view(-1, 1).to(dtype=x_proj.dtype, device=x_proj.device)
+    temp = max(float(indicator_temp), 1e-6)
+    depth = F.softplus((net_load - tau) / temp) * temp * float(delta_t_hours)
+    steps = max(1, int(round(float(ramp_window_hours) / max(float(delta_t_hours), 1e-6))))
+    ramp = torch.zeros_like(net_load)
+    if steps < net_load.shape[1]:
+        ramp[:, steps:] = F.relu(net_load[:, steps:] - net_load[:, :-steps])
+
+    load_high = resource_thresholds["load_high"].to(device=x_proj.device, dtype=x_proj.dtype)
+    wind_low = resource_thresholds["wind_low"].to(device=x_proj.device, dtype=x_proj.dtype)
+    solar_low = resource_thresholds["solar_low"].to(device=x_proj.device, dtype=x_proj.dtype)
+    sync = (
+        torch.sigmoid((x_proj[:, 0, :] - load_high) / temp)
+        + torch.sigmoid((wind_low - x_proj[:, 1, :]) / temp)
+        + torch.sigmoid((solar_low - x_proj[:, 2, :]) / temp)
+    )
+
+    d_norm = (depth - profile_norm["profile_d_mean"]) / profile_norm["profile_d_std"]
+    r_norm = (ramp - profile_norm["profile_r_mean"]) / profile_norm["profile_r_std"]
+    c_norm = (sync - profile_norm["profile_c_mean"]) / profile_norm["profile_c_std"]
+    target = target_profile.to(device=x_proj.device, dtype=x_proj.dtype)
+    d_loss = F.smooth_l1_loss(d_norm, target[:, 0, :])
+    r_loss = F.smooth_l1_loss(r_norm, target[:, 1, :])
+    c_loss = F.smooth_l1_loss(c_norm, target[:, 2, :])
+
+    mask = event_mask.to(device=x_proj.device, dtype=x_proj.dtype)
+    target_depth = target[:, 0, :] * profile_norm["profile_d_std"] + profile_norm["profile_d_mean"]
+    target_depth = target_depth.clamp(min=0.0)
+    p_core_pred = (depth * mask).sum(dim=1) / (depth.sum(dim=1) + 1e-6)
+    p_core_true = (target_depth * mask).sum(dim=1) / (target_depth.sum(dim=1) + 1e-6)
+    core_share_loss = F.smooth_l1_loss(p_core_pred, p_core_true)
+    return d_loss + r_loss + c_loss, d_loss, r_loss, c_loss, core_share_loss
+
+
 def _soft_windowed_ramp_torch(net: torch.Tensor, window_steps: int, duration_temp: float) -> torch.Tensor:
     if window_steps >= net.shape[1]:
         return torch.zeros((net.size(0),), device=net.device, dtype=net.dtype)
@@ -226,6 +433,68 @@ def _soft_windowed_ramp_torch(net: torch.Tensor, window_steps: int, duration_tem
     if ramp.shape[1] == 0:
         return torch.zeros((net.size(0),), device=net.device, dtype=net.dtype)
     return torch.logsumexp(ramp * duration_temp, dim=1) / duration_temp
+
+
+def soft_jirp_ramp_tail_intensity_torch(
+    x_denorm: torch.Tensor,
+    delta_t_hours: float = 1.0,
+    ramp_windows: str | Iterable[float] | None = None,
+    topk_ratio: float = 0.10,
+    definition: str = "multiscale_topk_mean",
+) -> torch.Tensor:
+    """Differentiable JIRP-v2 burst-regulation intensity.
+
+    R 使用多时间窗口正向净负荷爬坡的尾部均值。torch.topk 的选择集合是
+    分段可导的，足以作为 Stage 3 的轻量一致性约束。
+    """
+
+    net = x_denorm[:, 0, :] - x_denorm[:, 1, :] - x_denorm[:, 2, :]
+    ramps = []
+    for window in _parse_ramp_windows(ramp_windows):
+        steps = max(1, int(round(float(window) / float(delta_t_hours))))
+        if steps >= net.shape[1]:
+            continue
+        ramps.append(F.relu(net[:, steps:] - net[:, :-steps]))
+    if not ramps:
+        return torch.zeros((x_denorm.size(0),), device=x_denorm.device, dtype=x_denorm.dtype)
+    mode = str(definition).strip().lower()
+    if mode == "multiscale_max":
+        values = [ramp.max(dim=1).values for ramp in ramps]
+        return torch.stack(values, dim=1).max(dim=1).values
+    if mode == "multiscale_topk_mean":
+        merged = torch.cat(ramps, dim=1)
+        k = max(1, int(np.ceil(float(topk_ratio) * merged.shape[1])))
+        return torch.topk(merged, k=k, dim=1).values.mean(dim=1)
+    raise ValueError("definition must be 'multiscale_topk_mean' or 'multiscale_max'.")
+
+
+def soft_jirp_v2_metrics_torch(
+    x_denorm: torch.Tensor,
+    tau: torch.Tensor,
+    delta_t_hours: float = 1.0,
+    duration_temp: float = 12.0,
+    ramp_windows: str | Iterable[float] | None = None,
+    topk_ratio: float = 0.10,
+    ramp_definition: str = "multiscale_topk_mean",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute differentiable JIRP-v2 C/R/D metrics for Stage 3.
+
+    C：累计失衡强度；R：突发调节强度；D：持续影响程度。
+    """
+
+    net = x_denorm[:, 0, :] - x_denorm[:, 1, :] - x_denorm[:, 2, :]
+    tau = tau.view(-1, 1)
+    excess = F.softplus((net - tau) * duration_temp) / duration_temp
+    c = excess.sum(dim=1) * float(delta_t_hours)
+    r = soft_jirp_ramp_tail_intensity_torch(
+        x_denorm,
+        delta_t_hours=delta_t_hours,
+        ramp_windows=ramp_windows,
+        topk_ratio=topk_ratio,
+        definition=ramp_definition,
+    )
+    d = torch.sigmoid((net - tau) * duration_temp).sum(dim=1) * float(delta_t_hours)
+    return c, r, d
 
 
 def soft_risk_metrics_torch(
