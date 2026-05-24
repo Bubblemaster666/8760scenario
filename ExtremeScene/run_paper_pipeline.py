@@ -54,12 +54,21 @@ class PaperPipelineConfig:
     low_wind_quantile: float = 0.30
     low_resource_min_hours: int = 3
     daylight_irradiance_min: float = 30.0
+    min_event_hours: int = 6
+    use_adaptive_thresholds: bool = True
+    cold_temp_quantile: float = 0.10
+    cold_drop_24h_quantile: float = 0.95
+    adaptive_cold_drop_min: float = 4.5
+    heat_temp_quantile: float = 0.98
+    high_wind_speed_quantile: float = 0.99
+    snowfall_quantile: float = 0.97
 
     risk_screen_enabled: bool = True
     risk_screen_mode: str = "medium"
     min_cum_deficit: float = 0.0
     min_imbalance_duration: float = 1.0
     ramp_quantile: float = 0.70
+    min_samples_after_screen: int = 50
 
     imbalance_tau_mode: str = "monthly_quantile"
     imbalance_tau_quantile: float = 0.75
@@ -118,20 +127,16 @@ def _build_detect_config(cfg: PaperPipelineConfig) -> DetectConfig:
         low_wind_quantile=cfg.low_wind_quantile,
         low_resource_min_hours=cfg.low_resource_min_hours,
         daylight_irradiance_min=cfg.daylight_irradiance_min,
+        min_event_hours=cfg.min_event_hours,
+        use_adaptive_thresholds=cfg.use_adaptive_thresholds,
+        cold_temp_quantile=cfg.cold_temp_quantile,
+        cold_drop_24h_quantile=cfg.cold_drop_24h_quantile,
+        adaptive_cold_drop_min=cfg.adaptive_cold_drop_min,
+        heat_temp_quantile=cfg.heat_temp_quantile,
+        high_wind_speed_quantile=cfg.high_wind_speed_quantile,
+        snowfall_quantile=cfg.snowfall_quantile,
     )
-    if cfg.use_mock:
-        return DetectConfig(**common)
-    return DetectConfig(
-        **common,
-        use_adaptive_thresholds=True,
-        min_event_hours=6,
-        cold_temp_quantile=0.10,
-        cold_drop_24h_quantile=0.95,
-        adaptive_cold_drop_min=4.5,
-        heat_temp_quantile=0.98,
-        high_wind_speed_quantile=0.99,
-        snowfall_quantile=0.97,
-    )
+    return DetectConfig(**common)
 
 
 def run_pipeline(cfg: PaperPipelineConfig) -> dict:
@@ -158,6 +163,7 @@ def run_pipeline(cfg: PaperPipelineConfig) -> dict:
         min_cum_deficit=cfg.min_cum_deficit,
         min_imbalance_duration=cfg.min_imbalance_duration,
         ramp_quantile=cfg.ramp_quantile,
+        min_samples_after_screen=cfg.min_samples_after_screen,
         rain_require_power_impact=cfg.rain_require_power_impact,
     )
     evt_cfg = EVTConfig(
@@ -317,12 +323,21 @@ def parse_args() -> PaperPipelineConfig:
     parser.add_argument("--low-wind-quantile", type=float, default=0.30)
     parser.add_argument("--low-resource-min-hours", type=int, default=3)
     parser.add_argument("--daylight-irradiance-min", type=float, default=30.0)
+    parser.add_argument("--min-event-hours", type=int, default=6)
+    parser.add_argument("--use-adaptive-thresholds", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--cold-temp-quantile", type=float, default=0.10)
+    parser.add_argument("--cold-drop-24h-quantile", type=float, default=0.95)
+    parser.add_argument("--adaptive-cold-drop-min", type=float, default=4.5)
+    parser.add_argument("--heat-temp-quantile", type=float, default=0.98)
+    parser.add_argument("--high-wind-speed-quantile", type=float, default=0.99)
+    parser.add_argument("--snowfall-quantile", type=float, default=0.97)
 
     parser.add_argument("--risk-screen-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--risk-screen-mode", type=str, default="medium", choices=["loose", "medium", "strict", "hybrid"])
     parser.add_argument("--min-cum-deficit", type=float, default=0.0)
     parser.add_argument("--min-imbalance-duration", type=float, default=1.0)
     parser.add_argument("--ramp-quantile", type=float, default=0.70)
+    parser.add_argument("--min-samples-after-screen", type=int, default=50)
 
     parser.add_argument("--imbalance-tau-mode", type=str, default="monthly_quantile", choices=["global_quantile", "monthly_quantile", "seasonal_quantile", "fixed", "quantile"])
     parser.add_argument("--imbalance-tau-quantile", type=float, default=0.75)
@@ -368,11 +383,20 @@ def parse_args() -> PaperPipelineConfig:
         low_wind_quantile=args.low_wind_quantile,
         low_resource_min_hours=args.low_resource_min_hours,
         daylight_irradiance_min=args.daylight_irradiance_min,
+        min_event_hours=args.min_event_hours,
+        use_adaptive_thresholds=args.use_adaptive_thresholds,
+        cold_temp_quantile=args.cold_temp_quantile,
+        cold_drop_24h_quantile=args.cold_drop_24h_quantile,
+        adaptive_cold_drop_min=args.adaptive_cold_drop_min,
+        heat_temp_quantile=args.heat_temp_quantile,
+        high_wind_speed_quantile=args.high_wind_speed_quantile,
+        snowfall_quantile=args.snowfall_quantile,
         risk_screen_enabled=args.risk_screen_enabled,
         risk_screen_mode=args.risk_screen_mode,
         min_cum_deficit=args.min_cum_deficit,
         min_imbalance_duration=args.min_imbalance_duration,
         ramp_quantile=args.ramp_quantile,
+        min_samples_after_screen=args.min_samples_after_screen,
         imbalance_tau_mode=args.imbalance_tau_mode,
         imbalance_tau_quantile=args.imbalance_tau_quantile,
         imbalance_tau_fixed=args.imbalance_tau_fixed,
