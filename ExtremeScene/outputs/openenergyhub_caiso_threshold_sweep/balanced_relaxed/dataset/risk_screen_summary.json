@@ -1,0 +1,49 @@
+{
+  "enabled": true,
+  "config": {
+    "enabled": true,
+    "mode": "medium",
+    "min_cum_deficit": 0.0,
+    "min_imbalance_duration": 1.0,
+    "ramp_quantile": 0.6,
+    "keep_top_risk_ratio": null,
+    "min_samples_after_screen": 40,
+    "rain_require_power_impact": true
+  },
+  "before_count": 288,
+  "after_count": 229,
+  "removed_count": 59,
+  "removed_ratio": 0.2048611111111111,
+  "event_type_counts_before": {
+    "高温": 161,
+    "大风/沙尘暴": 123,
+    "寒潮": 4
+  },
+  "event_type_counts_after": {
+    "高温": 125,
+    "大风/沙尘暴": 101,
+    "寒潮": 3
+  },
+  "severity_counts_after": {
+    "0": 154,
+    "1": 37,
+    "2": 23,
+    "3": 15
+  },
+  "risk_screen_mode_used": "medium",
+  "screen_info": {
+    "mode_used": "medium",
+    "min_cum_deficit_used": 0.0,
+    "min_imbalance_duration_used": 1.0,
+    "ramp_threshold_used": 3412.533333333339,
+    "keep_top_risk_ratio": null
+  },
+  "heavy_rain_power_impact_screen": {
+    "enabled": true,
+    "before_heavy_rain_count": 0,
+    "after_heavy_rain_count": 0,
+    "removed_heavy_rain_count": 0,
+    "removed_heavy_rain_ratio": 0.0
+  },
+  "warnings": []
+}

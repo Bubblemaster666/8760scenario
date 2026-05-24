@@ -1,0 +1,6 @@
+{
+  "success": true,
+  "source_url": "existing-local-file",
+  "file_size_bytes": 29752780,
+  "note": "Raw CSV already existed locally and was reused."
+}

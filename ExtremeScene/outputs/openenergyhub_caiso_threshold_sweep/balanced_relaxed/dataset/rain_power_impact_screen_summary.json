@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "before_heavy_rain_count": 0,
+  "after_heavy_rain_count": 0,
+  "removed_heavy_rain_count": 0,
+  "removed_heavy_rain_ratio": 0.0
+}

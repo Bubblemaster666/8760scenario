@@ -1,0 +1,209 @@
+{
+  "build_cfg": {
+    "seq_len": 36,
+    "add_buffer_hours": 2,
+    "merge_overlap": false,
+    "train_ratio": 0.7,
+    "val_ratio": 0.15,
+    "test_ratio": 0.15,
+    "split_seed": 42,
+    "split_group_col": "sample_id",
+    "output_dir": "C:\\Users\\13411\\MyPython\\project\\ExtremeScene\\outputs\\openenergyhub_caiso_threshold_sweep\\balanced_relaxed\\dataset"
+  },
+  "column_mapping": {
+    "time_col": "time",
+    "load_col": "load",
+    "wind_col": "wind_power",
+    "solar_col": "solar_power",
+    "temp_col": "temp",
+    "wind_speed_col": "wind_speed",
+    "irradiance_col": "irradiance",
+    "snowfall_col": "snowfall",
+    "visibility_col": "visibility",
+    "precipitation_col": "precipitation"
+  },
+  "event_type_mapping": {
+    "寒潮": 0,
+    "暴雨/强降水": 1,
+    "大风/沙尘暴": 2,
+    "高温": 3
+  },
+  "evt_info": {
+    "method": "pot_gpd",
+    "metric_col": "cum_deficit",
+    "threshold_u": 23595.23750000001,
+    "shape_c": -0.34770850021045274,
+    "scale": 26428.92761379022,
+    "tail_prob_at_u": 0.10043668122270742,
+    "n_total": 229,
+    "n_exceed": 23,
+    "tail_score_stats": {
+      "mean": 0.9986050751336949,
+      "std": 1.0037090231562698
+    },
+    "severity_mode": "hybrid",
+    "severity_quantiles": {
+      "q1": 7578.124999999994,
+      "q2": 16405.733333333337,
+      "q3": 31332.142499999987,
+      "positive_only": true,
+      "n_for_quantiles": 187
+    },
+    "severity_level_counts": {
+      "0": 154,
+      "1": 37,
+      "2": 23,
+      "3": 15
+    },
+    "severity_thresholds": {
+      "severe_prob": 0.01,
+      "moderate_prob": 0.05,
+      "mild_prob": 0.1,
+      "severity_q1": 0.6,
+      "severity_q2": 0.8,
+      "severity_q3": 0.92
+    },
+    "risk_screening": {
+      "enabled": true,
+      "config": {
+        "enabled": true,
+        "mode": "medium",
+        "min_cum_deficit": 0.0,
+        "min_imbalance_duration": 1.0,
+        "ramp_quantile": 0.6,
+        "keep_top_risk_ratio": null,
+        "min_samples_after_screen": 40,
+        "rain_require_power_impact": true
+      },
+      "before_count": 288,
+      "after_count": 229,
+      "removed_count": 59,
+      "removed_ratio": 0.2048611111111111,
+      "event_type_counts_before": {
+        "高温": 161,
+        "大风/沙尘暴": 123,
+        "寒潮": 4
+      },
+      "event_type_counts_after": {
+        "高温": 125,
+        "大风/沙尘暴": 101,
+        "寒潮": 3
+      },
+      "severity_counts_after": {
+        "0": 154,
+        "1": 37,
+        "2": 23,
+        "3": 15
+      },
+      "risk_screen_mode_used": "medium",
+      "screen_info": {
+        "mode_used": "medium",
+        "min_cum_deficit_used": 0.0,
+        "min_imbalance_duration_used": 1.0,
+        "ramp_threshold_used": 3412.533333333339,
+        "keep_top_risk_ratio": null
+      },
+      "heavy_rain_power_impact_screen": {
+        "enabled": true,
+        "before_heavy_rain_count": 0,
+        "after_heavy_rain_count": 0,
+        "removed_heavy_rain_count": 0,
+        "removed_heavy_rain_ratio": 0.0
+      },
+      "warnings": []
+    }
+  },
+  "x_shape": [
+    229,
+    3,
+    36
+  ],
+  "event_mask_shape": [
+    229,
+    36
+  ],
+  "n_samples": 229,
+  "split_counts": {
+    "train": 160,
+    "test": 35,
+    "val": 34
+  },
+  "event_type_counts": {
+    "高温": 125,
+    "大风/沙尘暴": 101,
+    "寒潮": 3
+  },
+  "severity_level_counts": {
+    "0": 154,
+    "1": 37,
+    "2": 23,
+    "3": 15
+  },
+  "source": "real",
+  "detect_cfg": {
+    "time_col": "time",
+    "temp_col": "temp",
+    "wind_speed_col": "wind_speed",
+    "irradiance_col": "irradiance",
+    "snowfall_col": "snowfall",
+    "visibility_col": "visibility",
+    "precipitation_col": "precipitation",
+    "precipitation_fallback_col": "precipitation",
+    "freq_hours": 1,
+    "min_event_hours": 4,
+    "low_resource_min_hours": 2,
+    "cold_temp_threshold": -10.0,
+    "cold_drop_24h_threshold": 8.0,
+    "heat_temp_threshold": 35.0,
+    "high_wind_speed_threshold": 12.0,
+    "low_visibility_threshold": 3000.0,
+    "blowing_snow_wind_threshold": 8.0,
+    "replace_snow_with_heavy_rain": true,
+    "use_adaptive_rain_threshold": true,
+    "heavy_rain_quantile": 0.98,
+    "heavy_rain_rolling_quantile": 0.97,
+    "rain_rolling_window_hours": 3,
+    "heavy_rain_threshold": null,
+    "rain_min_event_hours": 2,
+    "rain_min_total_precip": null,
+    "rain_require_power_impact": true,
+    "snowfall_threshold": 1.0,
+    "snowfall_quantile": 0.97,
+    "snow_temp_margin": 2.0,
+    "require_wind_for_snow_event": false,
+    "snow_precip_relax_ratio_with_wind": 0.7,
+    "use_adaptive_thresholds": true,
+    "cold_temp_quantile": 0.15,
+    "cold_drop_24h_quantile": 0.9,
+    "heat_temp_quantile": 0.96,
+    "high_wind_speed_quantile": 0.96,
+    "adaptive_cold_drop_min": 4.5,
+    "low_irr_quantile": 0.4,
+    "low_wind_quantile": 0.35,
+    "daylight_irradiance_min": 30.0
+  },
+  "metric_cfg": {
+    "time_col": "time",
+    "load_col": "load",
+    "wind_power_col": "wind_power",
+    "solar_power_col": "solar_power",
+    "imbalance_tau_mode": "monthly_quantile",
+    "imbalance_tau_fixed": 0.0,
+    "imbalance_tau_quantile": 0.75,
+    "freq_hours": null
+  },
+  "risk_screen_cfg": {
+    "enabled": true,
+    "mode": "medium",
+    "min_cum_deficit": 0.0,
+    "min_imbalance_duration": 1.0,
+    "ramp_quantile": 0.6,
+    "keep_top_risk_ratio": null,
+    "min_samples_after_screen": 40,
+    "rain_require_power_impact": true
+  },
+  "rare_event_filter": {
+    "enabled": false,
+    "min_event_type_count": 5
+  }
+}
