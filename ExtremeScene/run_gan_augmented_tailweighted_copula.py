@@ -51,13 +51,20 @@ class GanAugmentedTailWeightedConfig(TailWeightedConfig):
     min_tail_samples_after_relax: int = 20
     min_tail_samples_before_relax: int = 30
     gan_candidate_ratio: float = 3.0
-    gan_keep_ratio: float = 0.30
+    gan_keep_ratio: float = 0.02
     corr_error_threshold: float = 0.20
     corr_error_threshold_relaxed: float = 0.30
     risk_filter_low_quantile: float = 0.70
     risk_filter_low_quantile_relaxed: float = 0.60
     risk_filter_high_quantile: float = 0.995
     ramp_upper_factor: float = 1.20
+    risk_filter_min_keep: int = 2
+    risk_fallback_priority_weight: float = 0.75
+    gan_target_cum_quantile: float = 0.85
+    gan_target_core_quantile: float = 0.85
+    gan_target_duration_quantile: float = 0.75
+    gan_ramp_soft_max_quantile: float = 0.75
+    gan_duration_soft_max_quantile: float = 0.95
     gan_epochs: int = 120
     gan_epochs_small: int = 80
     gan_batch_size: int = 32
@@ -67,6 +74,8 @@ class GanAugmentedTailWeightedConfig(TailWeightedConfig):
     gan_gp_lambda: float = 10.0
     gan_lr: float = 1.0e-4
     gan_keep_min: int = 1
+    corr_filter_min_keep: int = 1
+    corr_error_threshold_adaptive_factor: float = 1.35
 
 
 def _build_dataset_specs_four() -> list[DatasetSpec]:
@@ -293,28 +302,105 @@ def _risk_filter_candidates(
         tau_override = None
     risk = _build_candidate_risk_table(candidate_x, months, candidate_mask, train_risk, tau_by_month, cfg, tau_override)
 
-    def filter_with_low_q(low_q: float) -> np.ndarray:
+    def bounds_for_low_q(low_q: float) -> dict[str, float]:
         cum_low = float(np.quantile(train_risk["cum_deficit"], low_q))
         core_low = float(np.quantile(train_risk["core_cum_deficit"], low_q))
         cum_high = float(np.quantile(train_risk["cum_deficit"], float(cfg.risk_filter_high_quantile)))
         core_high = float(np.quantile(train_risk["core_cum_deficit"], float(cfg.risk_filter_high_quantile)))
         ramp_high = float(np.quantile(train_risk["netload_ramp_max"], float(cfg.risk_filter_high_quantile))) * float(cfg.ramp_upper_factor)
         dur_high = float(np.max(train_risk["imbalance_duration"]))
+        return {
+            "cum_low": cum_low,
+            "core_low": core_low,
+            "cum_high": cum_high,
+            "core_high": core_high,
+            "ramp_high": ramp_high,
+            "dur_high": max(dur_high, float(cfg.delta_t_hours)),
+        }
+
+    def filter_with_bounds(bounds: dict[str, float]) -> np.ndarray:
         keep = (
-            (risk["cum_deficit"].to_numpy(float) >= cum_low)
-            & (risk["cum_deficit"].to_numpy(float) <= cum_high)
-            & (risk["core_cum_deficit"].to_numpy(float) >= core_low)
-            & (risk["core_cum_deficit"].to_numpy(float) <= core_high)
-            & (risk["netload_ramp_max"].to_numpy(float) <= ramp_high)
-            & (risk["imbalance_duration"].to_numpy(float) <= max(dur_high, float(cfg.delta_t_hours)))
+            (risk["cum_deficit"].to_numpy(float) >= bounds["cum_low"])
+            & (risk["cum_deficit"].to_numpy(float) <= bounds["cum_high"])
+            & (risk["core_cum_deficit"].to_numpy(float) >= bounds["core_low"])
+            & (risk["core_cum_deficit"].to_numpy(float) <= bounds["core_high"])
+            & (risk["netload_ramp_max"].to_numpy(float) <= bounds["ramp_high"])
+            & (risk["imbalance_duration"].to_numpy(float) <= bounds["dur_high"])
         )
         return keep
 
-    keep = filter_with_low_q(float(cfg.risk_filter_low_quantile))
+    def soft_violation_score(bounds: dict[str, float]) -> np.ndarray:
+        eps = 1e-6
+        cum = risk["cum_deficit"].to_numpy(float)
+        core = risk["core_cum_deficit"].to_numpy(float)
+        ramp = risk["netload_ramp_max"].to_numpy(float)
+        dur = risk["imbalance_duration"].to_numpy(float)
+
+        def lower_violation(values: np.ndarray, lo: float) -> np.ndarray:
+            scale = max(abs(lo), 1.0)
+            return np.maximum(lo - values, 0.0) / (scale + eps)
+
+        def upper_violation(values: np.ndarray, hi: float) -> np.ndarray:
+            scale = max(abs(hi), 1.0)
+            return np.maximum(values - hi, 0.0) / (scale + eps)
+
+        return (
+            lower_violation(cum, bounds["cum_low"])
+            + upper_violation(cum, bounds["cum_high"])
+            + lower_violation(core, bounds["core_low"])
+            + upper_violation(core, bounds["core_high"])
+            + upper_violation(ramp, bounds["ramp_high"])
+            + upper_violation(dur, bounds["dur_high"])
+        ).astype(float)
+
+    def tail_candidate_priority_score() -> np.ndarray:
+        cum = risk["cum_deficit"].to_numpy(float)
+        core = risk["core_cum_deficit"].to_numpy(float)
+        ramp = risk["netload_ramp_max"].to_numpy(float)
+        dur = risk["imbalance_duration"].to_numpy(float)
+
+        def scaled_abs_to_quantile(values: np.ndarray, train_col: str, q: float) -> np.ndarray:
+            train = train_risk[train_col].to_numpy(float)
+            target = float(np.quantile(train, q))
+            q75, q25 = np.quantile(train, [0.75, 0.25])
+            scale = float(q75 - q25)
+            if scale <= 1e-6:
+                scale = float(np.std(train))
+            scale = scale if scale > 1e-6 else 1.0
+            return np.abs(values - target) / scale
+
+        def upper_quantile_penalty(values: np.ndarray, train_col: str, q: float) -> np.ndarray:
+            train = train_risk[train_col].to_numpy(float)
+            limit = float(np.quantile(train, q))
+            scale = max(abs(limit), 1.0)
+            return np.maximum(values - limit, 0.0) / scale
+
+        return (
+            0.35 * scaled_abs_to_quantile(cum, "cum_deficit", float(cfg.gan_target_cum_quantile))
+            + 0.30 * scaled_abs_to_quantile(core, "core_cum_deficit", float(cfg.gan_target_core_quantile))
+            + 0.15 * scaled_abs_to_quantile(dur, "imbalance_duration", float(cfg.gan_target_duration_quantile))
+            + 0.10 * upper_quantile_penalty(ramp, "netload_ramp_max", float(cfg.gan_ramp_soft_max_quantile))
+            + 0.10 * upper_quantile_penalty(dur, "imbalance_duration", float(cfg.gan_duration_soft_max_quantile))
+        ).astype(float)
+
+    keep = filter_with_bounds(bounds_for_low_q(float(cfg.risk_filter_low_quantile)))
     note = f"risk filter low quantile={cfg.risk_filter_low_quantile:.2f}"
     if int(keep.sum()) == 0:
-        keep = filter_with_low_q(float(cfg.risk_filter_low_quantile_relaxed))
+        relaxed_bounds = bounds_for_low_q(float(cfg.risk_filter_low_quantile_relaxed))
+        keep = filter_with_bounds(relaxed_bounds)
         note = f"risk filter relaxed to low quantile={cfg.risk_filter_low_quantile_relaxed:.2f}"
+        min_keep = min(int(cfg.risk_filter_min_keep), len(candidate_x))
+        if int(keep.sum()) < min_keep and len(candidate_x) > 0:
+            violation = soft_violation_score(relaxed_bounds)
+            priority = tail_candidate_priority_score()
+            combined = violation + float(cfg.risk_fallback_priority_weight) * priority
+            top_idx = np.argsort(combined)[:min_keep]
+            keep = np.zeros(len(candidate_x), dtype=bool)
+            keep[top_idx] = True
+            note = (
+                f"risk filter adaptive fallback kept top {min_keep} candidates "
+                f"by relaxed-bound violation plus tail-priority score after low quantile={cfg.risk_filter_low_quantile_relaxed:.2f}"
+            )
     return candidate_x[keep], candidate_meta.loc[keep].reset_index(drop=True), (candidate_mask[keep] if candidate_mask is not None else None), risk.loc[keep].reset_index(drop=True), note
 
 
@@ -356,8 +442,6 @@ def _build_candidate_risk_table(
 
 
 def _risk_match_scores(candidate_risk: pd.DataFrame, tail_real_risk: pd.DataFrame, full_train_risk: pd.DataFrame) -> np.ndarray:
-    center = tail_real_risk[["cum_deficit", "core_cum_deficit", "netload_ramp_max", "imbalance_duration"]].median()
-
     def safe_scale(col: str) -> float:
         arr = full_train_risk[col].to_numpy(dtype=float)
         if len(arr) <= 1:
@@ -369,11 +453,20 @@ def _risk_match_scores(candidate_risk: pd.DataFrame, tail_real_risk: pd.DataFram
         return scale if scale > 1e-6 else 1.0
 
     scales = {col: safe_scale(col) for col in ["cum_deficit", "core_cum_deficit", "netload_ramp_max", "imbalance_duration"]}
+    targets = {
+        "cum_deficit": float(np.quantile(full_train_risk["cum_deficit"].to_numpy(float), 0.85)),
+        "core_cum_deficit": float(np.quantile(full_train_risk["core_cum_deficit"].to_numpy(float), 0.85)),
+        "netload_ramp_max": float(np.quantile(full_train_risk["netload_ramp_max"].to_numpy(float), 0.75)),
+        "imbalance_duration": float(np.quantile(full_train_risk["imbalance_duration"].to_numpy(float), 0.75)),
+    }
+    ramp_limit = float(np.quantile(full_train_risk["netload_ramp_max"].to_numpy(float), 0.90))
+    duration_limit = float(np.quantile(full_train_risk["imbalance_duration"].to_numpy(float), 0.95))
     scores = (
-        np.abs(candidate_risk["cum_deficit"].to_numpy(float) - float(center["cum_deficit"])) / scales["cum_deficit"]
-        + np.abs(candidate_risk["core_cum_deficit"].to_numpy(float) - float(center["core_cum_deficit"])) / scales["core_cum_deficit"]
-        + np.abs(candidate_risk["netload_ramp_max"].to_numpy(float) - float(center["netload_ramp_max"])) / scales["netload_ramp_max"]
-        + np.abs(candidate_risk["imbalance_duration"].to_numpy(float) - float(center["imbalance_duration"])) / scales["imbalance_duration"]
+        0.35 * np.abs(candidate_risk["cum_deficit"].to_numpy(float) - targets["cum_deficit"]) / scales["cum_deficit"]
+        + 0.30 * np.abs(candidate_risk["core_cum_deficit"].to_numpy(float) - targets["core_cum_deficit"]) / scales["core_cum_deficit"]
+        + 0.15 * np.abs(candidate_risk["imbalance_duration"].to_numpy(float) - targets["imbalance_duration"]) / scales["imbalance_duration"]
+        + 0.10 * np.maximum(candidate_risk["netload_ramp_max"].to_numpy(float) - ramp_limit, 0.0) / scales["netload_ramp_max"]
+        + 0.10 * np.maximum(candidate_risk["imbalance_duration"].to_numpy(float) - duration_limit, 0.0) / scales["imbalance_duration"]
     )
     return scores.astype(float)
 
@@ -425,6 +518,29 @@ def _correlation_filter_candidates(
                 current = trial
         return kept_idx, current
 
+    def greedy_min_error(target_keep: int):
+        kept_idx: list[int] = []
+        current = _to_channel_time(x_tail_real).copy()
+        available = list(range(len(risk_sorted_x)))
+        while available and len(kept_idx) < target_keep:
+            best_idx = None
+            best_trial = None
+            best_err = None
+            for idx in available:
+                candidate_ct = _to_channel_time(risk_sorted_x[idx : idx + 1])
+                trial = np.concatenate([current, candidate_ct], axis=0)
+                err = _corr_error(x_tail_real, trial)
+                if best_err is None or err < best_err:
+                    best_idx = idx
+                    best_trial = trial
+                    best_err = err
+            if best_idx is None or best_trial is None:
+                break
+            kept_idx.append(best_idx)
+            current = best_trial
+            available.remove(best_idx)
+        return kept_idx, current
+
     kept_idx, current = greedy(float(cfg.corr_error_threshold))
     threshold_used = float(cfg.corr_error_threshold)
     note = "strict corr threshold"
@@ -432,6 +548,15 @@ def _correlation_filter_candidates(
         kept_idx, current = greedy(float(cfg.corr_error_threshold_relaxed))
         threshold_used = float(cfg.corr_error_threshold_relaxed)
         note = "relaxed corr threshold"
+    min_keep = min(int(cfg.corr_filter_min_keep), int(n_keep), len(risk_sorted_x))
+    if len(kept_idx) < min_keep and len(risk_sorted_x) > 0:
+        adaptive_idx, adaptive_current = greedy_min_error(min_keep)
+        if len(adaptive_idx) > len(kept_idx):
+            kept_idx = adaptive_idx
+            current = adaptive_current
+            adaptive_after = _corr_error(x_tail_real, current)
+            threshold_used = max(float(cfg.corr_error_threshold_relaxed), float(adaptive_after) * float(cfg.corr_error_threshold_adaptive_factor))
+            note = f"adaptive corr fallback kept {len(kept_idx)} lowest-error candidates"
 
     kept_x = risk_sorted_x[kept_idx] if kept_idx else risk_sorted_x[:0]
     kept_meta = risk_sorted_meta.iloc[kept_idx].reset_index(drop=True) if kept_idx else risk_sorted_meta.iloc[:0].copy()
@@ -813,13 +938,20 @@ def parse_args() -> GanAugmentedTailWeightedConfig:
     parser.add_argument("--min-tail-samples-after-relax", type=int, default=20)
     parser.add_argument("--min-tail-samples-before-relax", type=int, default=30)
     parser.add_argument("--gan-candidate-ratio", type=float, default=3.0)
-    parser.add_argument("--gan-keep-ratio", type=float, default=0.30)
+    parser.add_argument("--gan-keep-ratio", type=float, default=0.02)
     parser.add_argument("--corr-error-threshold", type=float, default=0.20)
     parser.add_argument("--corr-error-threshold-relaxed", type=float, default=0.30)
     parser.add_argument("--risk-filter-low-quantile", type=float, default=0.70)
     parser.add_argument("--risk-filter-low-quantile-relaxed", type=float, default=0.60)
     parser.add_argument("--risk-filter-high-quantile", type=float, default=0.995)
     parser.add_argument("--ramp-upper-factor", type=float, default=1.20)
+    parser.add_argument("--risk-filter-min-keep", type=int, default=2)
+    parser.add_argument("--risk-fallback-priority-weight", type=float, default=0.75)
+    parser.add_argument("--gan-target-cum-quantile", type=float, default=0.85)
+    parser.add_argument("--gan-target-core-quantile", type=float, default=0.85)
+    parser.add_argument("--gan-target-duration-quantile", type=float, default=0.75)
+    parser.add_argument("--gan-ramp-soft-max-quantile", type=float, default=0.75)
+    parser.add_argument("--gan-duration-soft-max-quantile", type=float, default=0.95)
     parser.add_argument("--gan-epochs", type=int, default=120)
     parser.add_argument("--gan-epochs-small", type=int, default=80)
     parser.add_argument("--gan-batch-size", type=int, default=32)
@@ -828,6 +960,8 @@ def parse_args() -> GanAugmentedTailWeightedConfig:
     parser.add_argument("--gan-n-critic", type=int, default=5)
     parser.add_argument("--gan-gp-lambda", type=float, default=10.0)
     parser.add_argument("--gan-lr", type=float, default=1e-4)
+    parser.add_argument("--corr-filter-min-keep", type=int, default=1)
+    parser.add_argument("--corr-error-threshold-adaptive-factor", type=float, default=1.35)
     return GanAugmentedTailWeightedConfig(**vars(parser.parse_args()))
 
 
