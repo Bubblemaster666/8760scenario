@@ -1,0 +1,13 @@
+﻿dataset,month,season,n_samples,imbalance_tau,source_used,fallback_reason
+muswellbrook,1,summer,25,8.451213836669922,month,
+muswellbrook,2,summer,7,7.490866661071777,season,month samples 7 < 10
+muswellbrook,3,autumn,9,5.469588756561279,global,month samples 9 and season samples 16 are insufficient
+muswellbrook,4,autumn,4,5.469588756561279,global,month samples 4 and season samples 16 are insufficient
+muswellbrook,5,autumn,3,5.469588756561279,global,month samples 3 and season samples 16 are insufficient
+muswellbrook,6,winter,0,5.469588756561279,global,month samples 0 and season samples 16 are insufficient
+muswellbrook,7,winter,4,5.469588756561279,global,month samples 4 and season samples 16 are insufficient
+muswellbrook,8,winter,12,5.011137962341309,month,
+muswellbrook,9,spring,5,3.935149669647217,season,month samples 5 < 10
+muswellbrook,10,spring,10,3.526768207550049,month,
+muswellbrook,11,spring,14,4.281394004821777,month,
+muswellbrook,12,summer,18,5.898713111877441,month,

@@ -1,0 +1,13 @@
+﻿dataset,month,season,n_samples,imbalance_tau,source_used,fallback_reason
+cessnock_or_newarea,1,summer,23,9.857865333557129,month,
+cessnock_or_newarea,2,summer,6,9.345823287963867,season,month samples 6 < 10
+cessnock_or_newarea,3,autumn,20,5.487819671630859,month,
+cessnock_or_newarea,4,autumn,4,5.496323585510254,season,month samples 4 < 10
+cessnock_or_newarea,5,autumn,2,5.496323585510254,season,month samples 2 < 10
+cessnock_or_newarea,6,winter,3,7.09947395324707,global,month samples 3 and season samples 16 are insufficient
+cessnock_or_newarea,7,winter,5,7.09947395324707,global,month samples 5 and season samples 16 are insufficient
+cessnock_or_newarea,8,winter,8,7.09947395324707,global,month samples 8 and season samples 16 are insufficient
+cessnock_or_newarea,9,spring,8,5.621253967285156,season,month samples 8 < 10
+cessnock_or_newarea,10,spring,11,4.632640838623047,month,
+cessnock_or_newarea,11,spring,14,6.033783912658691,month,
+cessnock_or_newarea,12,summer,18,8.150165557861328,month,

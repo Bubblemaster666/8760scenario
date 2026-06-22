@@ -1,0 +1,13 @@
+﻿dataset,month,season,n_samples,imbalance_tau,source_used,fallback_reason
+singleton,1,summer,24,7.579641342163086,month,
+singleton,2,summer,6,6.377369403839111,season,month samples 6 < 10
+singleton,3,autumn,9,5.346163749694824,global,month samples 9 and season samples 14 are insufficient
+singleton,4,autumn,1,5.346163749694824,global,month samples 1 and season samples 14 are insufficient
+singleton,5,autumn,4,5.346163749694824,global,month samples 4 and season samples 14 are insufficient
+singleton,6,winter,2,5.346163749694824,global,month samples 2 and season samples 13 are insufficient
+singleton,7,winter,4,5.346163749694824,global,month samples 4 and season samples 13 are insufficient
+singleton,8,winter,7,5.346163749694824,global,month samples 7 and season samples 13 are insufficient
+singleton,9,spring,4,5.346163749694824,global,month samples 4 and season samples 22 are insufficient
+singleton,10,spring,6,5.346163749694824,global,month samples 6 and season samples 22 are insufficient
+singleton,11,spring,12,4.242321968078613,month,
+singleton,12,summer,16,4.914991855621338,month,

@@ -1,0 +1,25 @@
+﻿dataset,sample_id,month,season,event_type,extreme_prob,quantile_level,target_cum,target_core,target_ramp,target_duration,target_max_imbalance_run,group_type,group_name,fallback_reason
+muswellbrook,0,7,winter,寒潮,0.41875,0.5,9.775089263916016,2.410369873046875,3.9756717681884766,8.0,6.0,global,all,month/event/season samples insufficient
+muswellbrook,1,12,summer,高温,0.18125,0.5,27.163557052612305,12.789454460144043,4.5038957595825195,11.0,9.0,event_type,高温,month_event samples insufficient for 12:高温
+muswellbrook,2,1,summer,高温,0.3125,0.5,21.93396759033203,8.937949180603027,4.589417934417725,9.5,7.0,month_event_type,1:高温,
+muswellbrook,3,1,summer,高温,0.10625,0.5,21.93396759033203,8.937949180603027,4.589417934417725,9.5,7.0,month_event_type,1:高温,
+muswellbrook,4,1,summer,高温,0.2,0.5,21.93396759033203,8.937949180603027,4.589417934417725,9.5,7.0,month_event_type,1:高温,
+muswellbrook,5,1,summer,高温,0.0446398044345315,0.5,21.93396759033203,8.937949180603027,4.589417934417725,9.5,7.0,month_event_type,1:高温,
+muswellbrook,6,1,summer,高温,0.0715580460309937,0.5,21.93396759033203,8.937949180603027,4.589417934417725,9.5,7.0,month_event_type,1:高温,
+muswellbrook,7,1,summer,高温,0.325,0.5,21.93396759033203,8.937949180603027,4.589417934417725,9.5,7.0,month_event_type,1:高温,
+muswellbrook,8,3,autumn,高温,0.53125,0.53125,28.767155170440674,13.343979835510254,4.678141951560974,11.1875,9.0,event_type,高温,month_event samples insufficient for 3:高温
+muswellbrook,9,12,summer,高温,0.28125,0.5,27.163557052612305,12.789454460144043,4.5038957595825195,11.0,9.0,event_type,高温,month_event samples insufficient for 12:高温
+muswellbrook,10,12,summer,高温,0.2375,0.5,27.163557052612305,12.789454460144043,4.5038957595825195,11.0,9.0,event_type,高温,month_event samples insufficient for 12:高温
+muswellbrook,11,1,summer,高温,0.425,0.5,21.93396759033203,8.937949180603027,4.589417934417725,9.5,7.0,month_event_type,1:高温,
+muswellbrook,12,2,summer,高温,0.0017095939356609,0.5,27.163557052612305,12.789454460144043,4.5038957595825195,11.0,9.0,event_type,高温,month_event samples insufficient for 2:高温
+muswellbrook,13,11,spring,大风/沙尘暴,0.965625,0.965625,54.00166702270508,25.422154545783997,7.032369449734688,17.21875,12.0,global,all,month/event/season samples insufficient
+muswellbrook,14,1,summer,暴雨/强降水,0.35625,0.5,3.018857955932617,0.03520560264587402,2.8809893131256104,4.5,3.5,event_type,暴雨/强降水,month_event samples insufficient for 1:暴雨/强降水
+muswellbrook,15,3,autumn,暴雨/强降水,0.39375,0.5,3.018857955932617,0.03520560264587402,2.8809893131256104,4.5,3.5,event_type,暴雨/强降水,month_event samples insufficient for 3:暴雨/强降水
+muswellbrook,16,2,summer,暴雨/强降水,0.625,0.625,8.403645277023315,0.7977311611175537,3.599659502506256,7.125,6.0,event_type,暴雨/强降水,month_event samples insufficient for 2:暴雨/强降水
+muswellbrook,17,3,autumn,暴雨/强降水,0.8875,0.8875,16.021092236042012,6.265504667162895,4.953633111715315,15.0,11.0,event_type,暴雨/强降水,month_event samples insufficient for 3:暴雨/强降水
+muswellbrook,18,12,summer,暴雨/强降水,0.78125,0.78125,12.364845424890518,3.256978750228882,4.096752405166626,12.0,8.0,event_type,暴雨/强降水,month_event samples insufficient for 12:暴雨/强降水
+muswellbrook,19,1,summer,暴雨/强降水,0.575,0.575,6.850719726085661,0.40889650583267195,3.3420043110847466,7.0,4.0,event_type,暴雨/强降水,month_event samples insufficient for 1:暴雨/强降水
+muswellbrook,20,2,summer,暴雨/强降水,0.7875,0.7875,12.37794440984726,3.266519069671631,4.107894992828369,12.0,8.0,event_type,暴雨/强降水,month_event samples insufficient for 2:暴雨/强降水
+muswellbrook,21,2,summer,暴雨/强降水,0.5125,0.5125,3.427283030748365,0.07348406910896298,2.952262577414512,5.0,4.0,event_type,暴雨/强降水,month_event samples insufficient for 2:暴雨/强降水
+muswellbrook,22,6,winter,暴雨/强降水,0.965625,0.965625,30.849614530801688,10.35706418901681,6.278020361065862,18.0,12.0,event_type,暴雨/强降水,month_event samples insufficient for 6:暴雨/强降水
+muswellbrook,23,7,winter,暴雨/强降水,0.4,0.5,3.018857955932617,0.03520560264587402,2.8809893131256104,4.5,3.5,event_type,暴雨/强降水,month_event samples insufficient for 7:暴雨/强降水

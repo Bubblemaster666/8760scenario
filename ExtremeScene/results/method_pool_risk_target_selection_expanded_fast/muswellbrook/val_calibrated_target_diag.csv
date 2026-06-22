@@ -1,0 +1,2 @@
+﻿dataset,split,method,selected_a,selected_b,scale_cum,scale_core,real_q99_cum,target_q99_cum,gen_q99_cum,real_q99_core,target_q99_core,gen_q99_core,target_error,generator_error
+muswellbrook,val,Calibrated_RiskFirst_TCN_Empirical,1.2,-0.05,1.5583505310022983,0.9509196713003358,89.1474283981323,89.1474283981323,,28.567170519828796,28.567170519828796,,0.0,

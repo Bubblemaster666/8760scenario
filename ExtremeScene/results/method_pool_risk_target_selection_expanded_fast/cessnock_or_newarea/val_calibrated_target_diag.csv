@@ -1,0 +1,2 @@
+﻿dataset,split,method,selected_a,selected_b,scale_cum,scale_core,real_q99_cum,target_q99_cum,gen_q99_cum,real_q99_core,target_q99_core,gen_q99_core,target_error,generator_error
+cessnock_or_newarea,val,Calibrated_RiskFirst_TCN_Empirical,1.2,0.05,0.9498558156846868,1.0822505773532027,110.01688194274902,110.01688194274902,,53.54422330856323,53.54422330856323,,0.0,
